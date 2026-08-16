@@ -16,14 +16,7 @@ vi.mock("@/hooks/useDragSort", () => ({
 vi.mock("@/components/providers/ProviderCard", () => ({
   ProviderCard: (props: any) => {
     providerCardRenderSpy(props);
-    const {
-      provider,
-      onSwitch,
-      onEdit,
-      onDelete,
-      onDuplicate,
-      onConfigureUsage,
-    } = props;
+    const { provider, onSwitch, onEdit, onDelete, onDuplicate } = props;
 
     return (
       <div data-testid={`provider-card-${provider.id}`}>
@@ -44,12 +37,6 @@ vi.mock("@/components/providers/ProviderCard", () => ({
           onClick={() => onDuplicate(provider)}
         >
           duplicate
-        </button>
-        <button
-          data-testid={`usage-${provider.id}`}
-          onClick={() => onConfigureUsage(provider)}
-        >
-          usage
         </button>
         <button
           data-testid={`delete-${provider.id}`}
@@ -80,22 +67,6 @@ vi.mock("@dnd-kit/sortable", async () => {
     useSortable: (...args: unknown[]) => useSortableMock(...args),
   };
 });
-
-// Mock hooks that use QueryClient
-vi.mock("@/hooks/useStreamCheck", () => ({
-  useStreamCheck: () => ({
-    checkProvider: vi.fn(),
-    isChecking: () => false,
-  }),
-}));
-
-vi.mock("@/lib/query/failover", () => ({
-  useAutoFailoverEnabled: () => ({ data: false }),
-  useFailoverQueue: () => ({ data: [] }),
-  useAddToFailoverQueue: () => ({ mutate: vi.fn() }),
-  useRemoveFromFailoverQueue: () => ({ mutate: vi.fn() }),
-  useReorderFailoverQueue: () => ({ mutate: vi.fn() }),
-}));
 
 function createProvider(overrides: Partial<Provider> = {}): Provider {
   return {
@@ -142,7 +113,7 @@ beforeEach(() => {
 });
 
 describe("ProviderList Component", () => {
-  it("should render skeleton placeholders when loading", () => {
+  it("should render one stable loading placeholder", () => {
     const { container } = renderWithQueryClient(
       <ProviderList
         providers={{}}
@@ -157,10 +128,8 @@ describe("ProviderList Component", () => {
       />,
     );
 
-    const placeholders = container.querySelectorAll(
-      ".border-dashed.border-muted-foreground\\/40",
-    );
-    expect(placeholders).toHaveLength(3);
+    expect(container.querySelector(".animate-pulse")).toBeInTheDocument();
+    expect(providerCardRenderSpy).not.toHaveBeenCalled();
   });
 
   it("should show empty state and trigger create callback when no providers exist", () => {
@@ -201,7 +170,6 @@ describe("ProviderList Component", () => {
     const handleEdit = vi.fn();
     const handleDelete = vi.fn();
     const handleDuplicate = vi.fn();
-    const handleUsage = vi.fn();
     const handleOpenWebsite = vi.fn();
 
     useDragSortMock.mockReturnValue({
@@ -219,7 +187,6 @@ describe("ProviderList Component", () => {
         onEdit={handleEdit}
         onDelete={handleDelete}
         onDuplicate={handleDuplicate}
-        onConfigureUsage={handleUsage}
         onOpenWebsite={handleOpenWebsite}
       />,
     );
@@ -235,12 +202,12 @@ describe("ProviderList Component", () => {
     // Drag attributes from useSortable
     expect(
       providerCardRenderSpy.mock.calls[0][0].dragHandleProps?.attributes[
-      "data-dnd-id"
+        "data-dnd-id"
       ],
     ).toBe("b");
     expect(
       providerCardRenderSpy.mock.calls[1][0].dragHandleProps?.attributes[
-      "data-dnd-id"
+        "data-dnd-id"
       ],
     ).toBe("a");
 
@@ -248,13 +215,11 @@ describe("ProviderList Component", () => {
     fireEvent.click(screen.getByTestId("switch-b"));
     fireEvent.click(screen.getByTestId("edit-b"));
     fireEvent.click(screen.getByTestId("duplicate-b"));
-    fireEvent.click(screen.getByTestId("usage-b"));
     fireEvent.click(screen.getByTestId("delete-a"));
 
     expect(handleSwitch).toHaveBeenCalledWith(providerB);
     expect(handleEdit).toHaveBeenCalledWith(providerB);
     expect(handleDuplicate).toHaveBeenCalledWith(providerB);
-    expect(handleUsage).toHaveBeenCalledWith(providerB);
     expect(handleDelete).toHaveBeenCalledWith(providerA);
 
     // Verify useDragSort call parameters
@@ -288,9 +253,7 @@ describe("ProviderList Component", () => {
     );
 
     fireEvent.keyDown(window, { key: "f", metaKey: true });
-    const searchInput = screen.getByPlaceholderText(
-      "Search name, notes, or URL...",
-    );
+    const searchInput = screen.getByPlaceholderText("搜索名称、备注或地址");
     // Initially both providers are rendered
     expect(screen.getByTestId("provider-card-alpha")).toBeInTheDocument();
     expect(screen.getByTestId("provider-card-beta")).toBeInTheDocument();
@@ -302,8 +265,6 @@ describe("ProviderList Component", () => {
     fireEvent.change(searchInput, { target: { value: "gamma" } });
     expect(screen.queryByTestId("provider-card-alpha")).not.toBeInTheDocument();
     expect(screen.queryByTestId("provider-card-beta")).not.toBeInTheDocument();
-    expect(
-      screen.getByText("No providers match your search."),
-    ).toBeInTheDocument();
+    expect(screen.getByText("没有匹配的供应商")).toBeInTheDocument();
   });
 });

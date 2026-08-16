@@ -1,7 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import type { AppId } from "@/lib/api";
-import type { VisibleApps } from "@/types";
+import { MANAGED_APP_IDS, type ManagedAppId } from "@/lib/api";
 import { ProviderIcon } from "@/components/ProviderIcon";
 import {
   Popover,
@@ -9,57 +8,37 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
-import { Monitor, MoreHorizontal, Terminal } from "lucide-react";
+import { MoreHorizontal, Terminal } from "lucide-react";
 
 const APP_BADGE_ICON: Partial<
-  Record<AppId, { icon: typeof Terminal; offsetY?: number }>
+  Record<ManagedAppId, { icon: typeof Terminal; offsetY?: number }>
 > = {
   claude: { icon: Terminal },
-  "claude-desktop": { icon: Monitor, offsetY: 0.5 },
 };
 
 interface AppSwitcherProps {
-  activeApp: AppId;
-  onSwitch: (app: AppId) => void;
-  visibleApps?: VisibleApps;
+  activeApp: ManagedAppId;
+  onSwitch: (app: ManagedAppId) => void;
+  visibleApps?: Partial<Record<ManagedAppId, boolean>>;
 }
 
-const ALL_APPS: AppId[] = [
-  "claude",
-  "claude-desktop",
-  "codex",
-  "gemini",
-  "grokbuild",
-  "opencode",
-  "openclaw",
-  "hermes",
-];
+const ALL_APPS: readonly ManagedAppId[] = MANAGED_APP_IDS;
 const STORAGE_KEY = "cc-switch-last-app";
 
-const APP_ICON_NAME: Record<AppId, string> = {
+const APP_ICON_NAME: Record<ManagedAppId, string> = {
   claude: "claude",
-  "claude-desktop": "claude",
   codex: "openai",
-  gemini: "gemini",
-  grokbuild: "grok",
   opencode: "opencode",
-  openclaw: "openclaw",
-  hermes: "hermes",
 };
 
-const APP_DISPLAY_NAME: Record<AppId, string> = {
+const APP_DISPLAY_NAME: Record<ManagedAppId, string> = {
   claude: "Claude Code",
-  "claude-desktop": "Claude Desktop",
   codex: "Codex",
-  gemini: "Gemini",
-  grokbuild: "Grok Build",
   opencode: "OpenCode",
-  openclaw: "OpenClaw",
-  hermes: "Hermes",
 };
 
 /** 应用图标 + 角标（Claude Code / Desktop 用角标区分终端与桌面） */
-function AppGlyph({ app, isActive }: { app: AppId; isActive: boolean }) {
+function AppGlyph({ app, isActive }: { app: ManagedAppId; isActive: boolean }) {
   const badgeConfig = APP_BADGE_ICON[app];
   const BadgeIcon = badgeConfig?.icon;
   return (
@@ -103,7 +82,7 @@ export function AppSwitcher({
   const rootRef = useRef<HTMLDivElement>(null);
   const [moreOpen, setMoreOpen] = useState(false);
 
-  const handleSwitch = (app: AppId) => {
+  const handleSwitch = (app: ManagedAppId) => {
     if (app === activeApp) return;
     localStorage.setItem(STORAGE_KEY, app);
     onSwitch(app);

@@ -5,6 +5,7 @@
 use crate::services::model_fetch::{self, FetchedModel};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::process::Stdio;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,47 +18,65 @@ const OPENCODE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// 获取 OpenCode 当前运行时可用的模型。
 ///
-/// 复用工具更新页的 CLI 定位逻辑执行 `opencode models`，因此会包含 OpenCode
-/// 已加载的 OAuth 模型与 Zen 免费模型，而不是只读取 opencode.json。
+/// 在固定的 WSL Ubuntu 环境中执行只读的 `opencode models` 查询。
 #[tauri::command]
 pub async fn get_opencode_models() -> Result<Vec<OpenCodeModelRef>, String> {
-    tokio::task::spawn_blocking(|| {
-        // Align runtime discovery with the OpenCode config directory that
-        // cc-switch already uses for live read/write (settings override included).
-        let config_dir = crate::opencode_config::get_opencode_dir();
-        let config_dir_env = config_dir.to_string_lossy().into_owned();
-        let extra_env = [
-            ("OPENCODE_CONFIG_DIR", config_dir_env),
-            ("OPENCODE_DISABLE_PROJECT_CONFIG", "true".to_string()),
-        ];
-        let output = super::misc::run_detected_tool_command_with_timeout(
-            "opencode",
-            &["models"],
-            Some(OPENCODE_MODELS_TIMEOUT),
-            &extra_env,
-            &config_dir,
-        )?;
-        if !output.status.success() {
-            let stderr = super::misc::decode_command_output(&output.stderr);
-            let stdout = super::misc::decode_command_output(&output.stdout);
-            let detail = if stderr.trim().is_empty() {
-                stdout.trim()
-            } else {
-                stderr.trim()
-            };
-            return Err(if detail.is_empty() {
-                "Failed to load OpenCode models".to_string()
-            } else {
-                format!("Failed to load OpenCode models: {detail}")
-            });
-        }
+    let config_dir = crate::opencode_config::get_opencode_dir();
+    let config_dir_env = config_dir.to_string_lossy().into_owned();
 
-        Ok(parse_opencode_models(&super::misc::decode_command_output(
-            &output.stdout,
-        )))
-    })
-    .await
-    .map_err(|e| format!("OpenCode model discovery task failed: {e}"))?
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("wsl.exe");
+        command.args([
+            "-d",
+            "Ubuntu",
+            "-u",
+            "zhldm",
+            "--",
+            "env",
+            &format!("OPENCODE_CONFIG_DIR={config_dir_env}"),
+            "OPENCODE_DISABLE_PROJECT_CONFIG=true",
+            "opencode",
+            "models",
+        ]);
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = tokio::process::Command::new("opencode");
+        command
+            .arg("models")
+            .env("OPENCODE_CONFIG_DIR", &config_dir_env)
+            .env("OPENCODE_DISABLE_PROJECT_CONFIG", "true")
+            .current_dir(&config_dir);
+        command
+    };
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = tokio::time::timeout(OPENCODE_MODELS_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "OpenCode model discovery timed out".to_string())?
+        .map_err(|error| format!("Failed to start OpenCode: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(if detail.is_empty() {
+            "Failed to load OpenCode models".to_string()
+        } else {
+            format!("Failed to load OpenCode models: {detail}")
+        });
+    }
+
+    Ok(parse_opencode_models(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_opencode_models(output: &str) -> Vec<OpenCodeModelRef> {
@@ -89,8 +108,8 @@ fn parse_opencode_models(output: &str) -> Vec<OpenCodeModelRef> {
 
 /// 获取供应商的可用模型列表
 ///
-/// 使用 OpenAI 兼容的 GET /v1/models 端点。优先使用 `models_url` 精确覆写；
-/// 否则对 baseURL 生成候选列表（含「剥离 Anthropic 兼容子路径」兜底），按序尝试。
+/// 使用 OpenAI 兼容的 GET /models 端点。优先使用 `models_url` 精确覆写；
+/// 否则从当前 Base URL 唯一确定一个目标，不尝试其他地址。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn fetch_models_for_config(
     base_url: String,
@@ -99,7 +118,6 @@ pub async fn fetch_models_for_config(
     models_url: Option<String>,
     custom_user_agent: Option<String>,
 ) -> Result<Vec<FetchedModel>, String> {
-    // 与转发 / 检测路径共用 parse_custom_user_agent：非法 UA 静默忽略（不阻断取模型）。
     let user_agent = crate::provider::parse_custom_user_agent(custom_user_agent.as_deref())
         .ok()
         .flatten();

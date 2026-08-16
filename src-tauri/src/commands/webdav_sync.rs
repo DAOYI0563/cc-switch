@@ -1,47 +1,22 @@
 #![allow(non_snake_case)]
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::State;
+use zeroize::Zeroizing;
 
-use crate::commands::sync_support::{
-    attach_warning, post_sync_warning_from_result, run_post_import_sync,
+use crate::adapters::{FixedSyncCryptoEngine, ReqwestSyncWebDavTransport, RuntimeSyncLocalAdapter};
+use crate::domain::{
+    Sha256Digest, SyncDevice, SyncDeviceId, SyncFirstSyncPreview, SyncSchemaVersion,
 };
-use crate::error::AppError;
-use crate::services::webdav_sync as webdav_sync_service;
+use crate::services::{
+    ConflictCenterRuntimeState, SyncDeviceRetireRequest, SyncFirstSyncConfirmRequest,
+    SyncFirstSyncPreviewRequest, SyncRunError, SyncRunErrorCode, SyncRunResult, SyncV3Orchestrator,
+};
 use crate::settings::{self, WebDavSyncSettings};
 use crate::store::AppState;
 
-fn persist_sync_error(settings: &mut WebDavSyncSettings, error: &AppError, source: &str) {
-    settings.status.last_error = Some(error.to_string());
-    settings.status.last_error_source = Some(source.to_string());
-    let _ = settings::update_webdav_sync_status(settings.status.clone());
-}
-
-fn webdav_not_configured_error() -> String {
-    AppError::localized(
-        "webdav.sync.not_configured",
-        "未配置 WebDAV 同步",
-        "WebDAV sync is not configured.",
-    )
-    .to_string()
-}
-
-fn webdav_sync_disabled_error() -> String {
-    AppError::localized(
-        "webdav.sync.disabled",
-        "WebDAV 同步未启用",
-        "WebDAV sync is disabled.",
-    )
-    .to_string()
-}
-
-fn require_enabled_webdav_settings() -> Result<WebDavSyncSettings, String> {
-    let settings = settings::get_webdav_sync_settings().ok_or_else(webdav_not_configured_error)?;
-    if !settings.enabled {
-        return Err(webdav_sync_disabled_error());
-    }
-    Ok(settings)
-}
+use crate::adapters::temporary_rollback::FixedTemporaryRollbackStore;
 
 fn resolve_password_for_request(
     mut incoming: WebDavSyncSettings,
@@ -56,86 +31,32 @@ fn resolve_password_for_request(
     incoming
 }
 
-#[cfg(test)]
-fn webdav_sync_mutex() -> &'static tokio::sync::Mutex<()> {
-    webdav_sync_service::sync_mutex()
-}
-
-async fn run_with_webdav_lock<T, Fut>(operation: Fut) -> Result<T, AppError>
-where
-    Fut: std::future::Future<Output = Result<T, AppError>>,
-{
-    webdav_sync_service::run_with_sync_lock(operation).await
-}
-
-fn map_sync_result<T, F>(result: Result<T, AppError>, on_error: F) -> Result<T, String>
-where
-    F: FnOnce(&AppError),
-{
-    match result {
-        Ok(value) => Ok(value),
-        Err(err) => {
-            on_error(&err);
-            Err(err.to_string())
-        }
-    }
-}
-
 #[tauri::command]
 pub async fn webdav_test_connection(
     settings: WebDavSyncSettings,
     #[allow(non_snake_case)] preserveEmptyPassword: Option<bool>,
 ) -> Result<Value, String> {
     let preserve_empty = preserveEmptyPassword.unwrap_or(true);
-    let resolved = resolve_password_for_request(
+    let mut resolved = resolve_password_for_request(
         settings,
         settings::get_webdav_sync_settings(),
         preserve_empty,
     );
-    webdav_sync_service::check_connection(&resolved)
+    resolved.normalize();
+    resolved.validate().map_err(|error| error.to_string())?;
+
+    let transport =
+        ReqwestSyncWebDavTransport::new(&resolved.base_url, &resolved.username, &resolved.password)
+            .map_err(|error| error.to_string())?;
+    transport
+        .test_connection()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+
     Ok(json!({
         "success": true,
         "message": "WebDAV connection ok"
     }))
-}
-
-#[tauri::command]
-pub async fn webdav_sync_upload(state: State<'_, AppState>) -> Result<Value, String> {
-    let db = state.db.clone();
-    let mut settings = require_enabled_webdav_settings()?;
-
-    let result = run_with_webdav_lock(webdav_sync_service::upload(&db, &mut settings)).await;
-    map_sync_result(result, |error| {
-        persist_sync_error(&mut settings, error, "manual")
-    })
-}
-
-#[tauri::command]
-pub async fn webdav_sync_download(state: State<'_, AppState>) -> Result<Value, String> {
-    let db = state.db.clone();
-    let db_for_sync = db.clone();
-    let mut settings = require_enabled_webdav_settings()?;
-    let _auto_sync_suppression = crate::services::webdav_auto_sync::AutoSyncSuppressionGuard::new();
-
-    let sync_result = run_with_webdav_lock(webdav_sync_service::download(&db, &mut settings)).await;
-    let mut result = map_sync_result(sync_result, |error| {
-        persist_sync_error(&mut settings, error, "manual")
-    })?;
-
-    // Post-download sync is best-effort: snapshot restore has already succeeded.
-    let warning = post_sync_warning_from_result(
-        tauri::async_runtime::spawn_blocking(move || run_post_import_sync(db_for_sync))
-            .await
-            .map_err(|e| e.to_string()),
-    );
-    if let Some(msg) = warning.as_ref() {
-        log::warn!("[WebDAV] post-download sync warning: {msg}");
-    }
-    result = attach_warning(result, warning);
-
-    Ok(result)
 }
 
 #[tauri::command]
@@ -145,89 +66,300 @@ pub async fn webdav_sync_save_settings(
 ) -> Result<Value, String> {
     let password_touched = passwordTouched.unwrap_or(false);
     let existing = settings::get_webdav_sync_settings();
-    let mut sync_settings =
-        resolve_password_for_request(settings, existing.clone(), !password_touched);
-
-    // Preserve server-owned fields that the frontend does not manage
-    if let Some(existing_settings) = existing {
-        sync_settings.status = existing_settings.status;
-    }
+    let mut sync_settings = resolve_password_for_request(settings, existing, !password_touched);
 
     sync_settings.normalize();
-    sync_settings.validate().map_err(|e| e.to_string())?;
-    settings::set_webdav_sync_settings(Some(sync_settings)).map_err(|e| e.to_string())?;
+    sync_settings
+        .validate()
+        .map_err(|error| error.to_string())?;
+    settings::set_webdav_sync_settings(Some(sync_settings), password_touched)
+        .map_err(|error| error.to_string())?;
     Ok(json!({ "success": true }))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebDavFirstSyncPreviewCommandRequest {
+    pub passphrase: String,
+    pub display_name: String,
+    pub candidate_device_id: Option<SyncDeviceId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebDavFirstSyncConfirmCommandRequest {
+    pub passphrase: String,
+    pub display_name: String,
+    pub candidate_device_id: SyncDeviceId,
+    pub observed_at_ms: i64,
+    pub expected_preview_token: Sha256Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebDavSyncNowCommandRequest {
+    pub passphrase: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebDavDeviceRetireCommandRequest {
+    pub passphrase: String,
+    pub target_device_id: SyncDeviceId,
+    pub confirmed_target_device_id: SyncDeviceId,
+}
+
 #[tauri::command]
-pub async fn webdav_sync_fetch_remote_info() -> Result<Value, String> {
-    let settings = require_enabled_webdav_settings()?;
-    let info = webdav_sync_service::fetch_remote_info(&settings)
+pub async fn webdav_sync_preview_first(
+    request: WebDavFirstSyncPreviewCommandRequest,
+    app_state: State<'_, AppState>,
+    conflict_state: State<'_, ConflictCenterRuntimeState>,
+) -> Result<SyncFirstSyncPreview, SyncRunError> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let candidate_device_id = request.candidate_device_id.unwrap_or_else(|| {
+        SyncDeviceId::new(format!("device-{}", uuid::Uuid::new_v4().simple()))
+            .expect("UUID-based sync device ID is valid")
+    });
+    let local = RuntimeSyncLocalAdapter::new(app_state.inner());
+    let snapshot = local
+        .snapshot(&candidate_device_id, now_ms)
+        .map_err(map_local_snapshot_error)?;
+    if snapshot.identity.is_some() {
+        return Err(SyncRunError::new(
+            SyncRunErrorCode::InvalidInput,
+            "this device is already registered; use sync now",
+        ));
+    }
+    let passphrase = Zeroizing::new(request.passphrase);
+    let transport = configured_transport()?;
+    let crypto = FixedSyncCryptoEngine::runtime();
+    let rollbacks = FixedTemporaryRollbackStore::runtime();
+    let conflicts = conflict_state.webdav();
+    let orchestrator =
+        SyncV3Orchestrator::new(&transport, &crypto, &local, &rollbacks, conflicts.as_ref());
+    orchestrator
+        .preview_first_sync(
+            passphrase.as_bytes(),
+            SyncFirstSyncPreviewRequest {
+                schema_version: SyncSchemaVersion::V1,
+                candidate_device_id,
+                display_name: request.display_name,
+                observed_at_ms: now_ms,
+                baselines: snapshot.baselines,
+                local_records: snapshot.local_records,
+            },
+        )
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(info.unwrap_or(json!({ "empty": true })))
+}
+
+#[tauri::command]
+pub async fn webdav_sync_confirm_first(
+    request: WebDavFirstSyncConfirmCommandRequest,
+    app_state: State<'_, AppState>,
+    conflict_state: State<'_, ConflictCenterRuntimeState>,
+) -> Result<SyncRunResult, SyncRunError> {
+    let confirmed_at_ms = chrono::Utc::now()
+        .timestamp_millis()
+        .max(request.observed_at_ms);
+    let local = RuntimeSyncLocalAdapter::new(app_state.inner());
+    let snapshot = local
+        .snapshot(&request.candidate_device_id, request.observed_at_ms)
+        .map_err(map_local_snapshot_error)?;
+    let passphrase = Zeroizing::new(request.passphrase);
+    let transport = configured_transport()?;
+    let crypto = FixedSyncCryptoEngine::runtime();
+    let rollbacks = FixedTemporaryRollbackStore::runtime();
+    let conflicts = conflict_state.webdav();
+    let orchestrator =
+        SyncV3Orchestrator::new(&transport, &crypto, &local, &rollbacks, conflicts.as_ref());
+    orchestrator
+        .confirm_first_sync(
+            passphrase.as_bytes(),
+            SyncFirstSyncConfirmRequest {
+                schema_version: SyncSchemaVersion::V1,
+                candidate_device_id: request.candidate_device_id,
+                display_name: request.display_name,
+                observed_at_ms: request.observed_at_ms,
+                baselines: snapshot.baselines,
+                local_records: snapshot.local_records,
+                expected_preview_token: request.expected_preview_token,
+                existing_identity: snapshot.identity,
+                confirmed_at_ms,
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn webdav_sync_now(
+    request: WebDavSyncNowCommandRequest,
+    app_state: State<'_, AppState>,
+    conflict_state: State<'_, ConflictCenterRuntimeState>,
+) -> Result<SyncRunResult, SyncRunError> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let identity = require_local_identity(app_state.inner())?;
+    let local = RuntimeSyncLocalAdapter::new(app_state.inner());
+    let snapshot = local
+        .snapshot(&identity.device_id, now_ms)
+        .map_err(map_local_snapshot_error)?;
+    let passphrase = Zeroizing::new(request.passphrase);
+    let transport = configured_transport()?;
+    let crypto = FixedSyncCryptoEngine::runtime();
+    let rollbacks = FixedTemporaryRollbackStore::runtime();
+    let conflicts = conflict_state.webdav();
+    let orchestrator =
+        SyncV3Orchestrator::new(&transport, &crypto, &local, &rollbacks, conflicts.as_ref());
+    orchestrator
+        .synchronize(
+            passphrase.as_bytes(),
+            crate::services::SyncRunRequest {
+                schema_version: SyncSchemaVersion::V1,
+                device_id: identity.device_id,
+                now_ms,
+                baselines: snapshot.baselines,
+                local_records: snapshot.local_records,
+            },
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn webdav_sync_list_devices(
+    request: WebDavSyncNowCommandRequest,
+    app_state: State<'_, AppState>,
+    conflict_state: State<'_, ConflictCenterRuntimeState>,
+) -> Result<Vec<SyncDevice>, SyncRunError> {
+    require_local_identity(app_state.inner())?;
+    let passphrase = Zeroizing::new(request.passphrase);
+    let transport = configured_transport()?;
+    let crypto = FixedSyncCryptoEngine::runtime();
+    let local = RuntimeSyncLocalAdapter::new(app_state.inner());
+    let rollbacks = FixedTemporaryRollbackStore::runtime();
+    let conflicts = conflict_state.webdav();
+    SyncV3Orchestrator::new(&transport, &crypto, &local, &rollbacks, conflicts.as_ref())
+        .list_devices(passphrase.as_bytes())
+        .await
+}
+
+#[tauri::command]
+pub async fn webdav_sync_retire_device(
+    request: WebDavDeviceRetireCommandRequest,
+    app_state: State<'_, AppState>,
+    conflict_state: State<'_, ConflictCenterRuntimeState>,
+) -> Result<SyncRunResult, SyncRunError> {
+    let identity = require_local_identity(app_state.inner())?;
+    let passphrase = Zeroizing::new(request.passphrase);
+    let transport = configured_transport()?;
+    let crypto = FixedSyncCryptoEngine::runtime();
+    let local = RuntimeSyncLocalAdapter::new(app_state.inner());
+    let rollbacks = FixedTemporaryRollbackStore::runtime();
+    let conflicts = conflict_state.webdav();
+    SyncV3Orchestrator::new(&transport, &crypto, &local, &rollbacks, conflicts.as_ref())
+        .retire_device(
+            passphrase.as_bytes(),
+            SyncDeviceRetireRequest {
+                schema_version: SyncSchemaVersion::V1,
+                writer_device_id: identity.device_id,
+                target_device_id: request.target_device_id,
+                confirmed_target_device_id: request.confirmed_target_device_id,
+                retired_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await
+}
+
+fn configured_transport() -> Result<ReqwestSyncWebDavTransport, SyncRunError> {
+    let mut configured = settings::get_webdav_sync_settings().ok_or_else(|| {
+        SyncRunError::new(
+            SyncRunErrorCode::InvalidInput,
+            "WebDAV settings must be saved before synchronization",
+        )
+    })?;
+    configured.normalize();
+    configured.validate().map_err(|_| {
+        SyncRunError::new(
+            SyncRunErrorCode::InvalidInput,
+            "saved WebDAV settings are invalid",
+        )
+    })?;
+    let base_url = sync_profile_base_url(&configured)?;
+    ReqwestSyncWebDavTransport::new(&base_url, &configured.username, &configured.password).map_err(
+        |_| {
+            SyncRunError::new(
+                SyncRunErrorCode::InvalidInput,
+                "saved WebDAV transport settings are invalid",
+            )
+        },
+    )
+}
+
+fn sync_profile_base_url(settings: &WebDavSyncSettings) -> Result<String, SyncRunError> {
+    validate_remote_component(&settings.remote_root)?;
+    validate_remote_component(&settings.profile)?;
+    let mut url = url::Url::parse(&settings.base_url)
+        .map_err(|_| SyncRunError::new(SyncRunErrorCode::InvalidInput, "WebDAV URL is invalid"))?;
+    let mut segments = url.path_segments_mut().map_err(|_| {
+        SyncRunError::new(
+            SyncRunErrorCode::InvalidInput,
+            "WebDAV URL cannot contain sync paths",
+        )
+    })?;
+    segments.pop_if_empty();
+    segments.push(&settings.remote_root);
+    segments.push(&settings.profile);
+    drop(segments);
+    Ok(url.to_string())
+}
+
+fn validate_remote_component(value: &str) -> Result<(), SyncRunError> {
+    let valid = !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(SyncRunError::new(
+            SyncRunErrorCode::InvalidInput,
+            "WebDAV sync root or profile is invalid",
+        ))
+    }
+}
+
+fn require_local_identity(
+    state: &AppState,
+) -> Result<crate::domain::FixedSyncDeviceIdentity, SyncRunError> {
+    state
+        .db
+        .load_sync_identity()
+        .map_err(|_| {
+            SyncRunError::new(
+                SyncRunErrorCode::LocalApply,
+                "fixed sync device identity could not be read",
+            )
+        })?
+        .ok_or_else(|| {
+            SyncRunError::new(
+                SyncRunErrorCode::InvalidInput,
+                "first sync must be previewed and confirmed on this device",
+            )
+        })
+}
+
+fn map_local_snapshot_error(_error: crate::ports::ConflictCenterError) -> SyncRunError {
+    SyncRunError::new(
+        SyncRunErrorCode::LocalApply,
+        "local portable sync snapshot could not be prepared",
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        map_sync_result, persist_sync_error, require_enabled_webdav_settings,
-        resolve_password_for_request, run_with_webdav_lock, webdav_sync_mutex,
-    };
-    use crate::error::AppError;
-    use crate::settings::{AppSettings, WebDavSyncSettings};
-    use serial_test::serial;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn webdav_sync_mutex_is_singleton() {
-        let a = webdav_sync_mutex() as *const _;
-        let b = webdav_sync_mutex() as *const _;
-        assert_eq!(a, b);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn webdav_sync_mutex_serializes_concurrent_access() {
-        let guard = webdav_sync_mutex().lock().await;
-        let acquired = Arc::new(AtomicBool::new(false));
-        let acquired_bg = Arc::clone(&acquired);
-
-        let waiter = tokio::spawn(async move {
-            let _inner_guard = webdav_sync_mutex().lock().await;
-            acquired_bg.store(true, Ordering::SeqCst);
-        });
-
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        assert!(!acquired.load(Ordering::SeqCst));
-
-        drop(guard);
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("background task should complete after lock release")
-            .expect("background task should not panic");
-
-        assert!(acquired.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn map_sync_result_runs_error_handler_after_lock_release() {
-        let result = run_with_webdav_lock(async {
-            Err::<(), AppError>(AppError::Config("boom".to_string()))
-        })
-        .await;
-
-        let mut lock_released = false;
-        let mapped = map_sync_result(result, |_| {
-            lock_released = webdav_sync_mutex().try_lock().is_ok();
-        });
-
-        assert!(mapped.is_err());
-        assert!(lock_released);
-    }
+    use super::resolve_password_for_request;
+    use crate::settings::WebDavSyncSettings;
 
     #[test]
     fn resolve_password_for_request_preserves_existing_when_requested() {
@@ -259,99 +391,5 @@ mod tests {
         });
         let resolved = resolve_password_for_request(incoming, existing, false);
         assert!(resolved.password.is_empty());
-    }
-
-    #[test]
-    #[serial]
-    fn persist_sync_error_updates_status_without_overwriting_credentials() {
-        let test_home = std::env::temp_dir().join("cc-switch-sync-error-status-test");
-        let _ = std::fs::remove_dir_all(&test_home);
-        std::fs::create_dir_all(&test_home).expect("create test home");
-        std::env::set_var("CC_SWITCH_TEST_HOME", &test_home);
-
-        crate::settings::update_settings(AppSettings::default()).expect("reset settings");
-        let mut current = WebDavSyncSettings {
-            enabled: true,
-            base_url: "https://dav.example.com/dav/".to_string(),
-            username: "alice".to_string(),
-            password: "secret".to_string(),
-            remote_root: "cc-switch-sync".to_string(),
-            profile: "default".to_string(),
-            ..WebDavSyncSettings::default()
-        };
-        crate::settings::set_webdav_sync_settings(Some(current.clone()))
-            .expect("seed webdav settings");
-
-        persist_sync_error(
-            &mut current,
-            &crate::error::AppError::Config("boom".to_string()),
-            "manual",
-        );
-
-        let after = crate::settings::get_webdav_sync_settings().expect("read webdav settings");
-        assert_eq!(after.base_url, "https://dav.example.com/dav/");
-        assert_eq!(after.username, "alice");
-        assert_eq!(after.password, "secret");
-        assert_eq!(after.remote_root, "cc-switch-sync");
-        assert_eq!(after.profile, "default");
-        assert!(
-            after
-                .status
-                .last_error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("boom"),
-            "status error should be updated"
-        );
-        assert_eq!(after.status.last_error_source.as_deref(), Some("manual"));
-    }
-
-    #[test]
-    #[serial]
-    fn require_enabled_webdav_settings_rejects_disabled_config() {
-        let test_home = std::env::temp_dir().join("cc-switch-sync-enabled-disabled-test");
-        let _ = std::fs::remove_dir_all(&test_home);
-        std::fs::create_dir_all(&test_home).expect("create test home");
-        std::env::set_var("CC_SWITCH_TEST_HOME", &test_home);
-
-        crate::settings::update_settings(AppSettings::default()).expect("reset settings");
-        crate::settings::set_webdav_sync_settings(Some(WebDavSyncSettings {
-            enabled: false,
-            base_url: "https://dav.example.com/dav/".to_string(),
-            username: "alice".to_string(),
-            password: "secret".to_string(),
-            ..WebDavSyncSettings::default()
-        }))
-        .expect("seed disabled webdav settings");
-
-        let err = require_enabled_webdav_settings().expect_err("disabled settings should fail");
-        assert!(
-            err.contains("disabled") || err.contains("未启用"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn require_enabled_webdav_settings_returns_settings_when_enabled() {
-        let test_home = std::env::temp_dir().join("cc-switch-sync-enabled-ok-test");
-        let _ = std::fs::remove_dir_all(&test_home);
-        std::fs::create_dir_all(&test_home).expect("create test home");
-        std::env::set_var("CC_SWITCH_TEST_HOME", &test_home);
-
-        crate::settings::update_settings(AppSettings::default()).expect("reset settings");
-        crate::settings::set_webdav_sync_settings(Some(WebDavSyncSettings {
-            enabled: true,
-            base_url: "https://dav.example.com/dav/".to_string(),
-            username: "alice".to_string(),
-            password: "secret".to_string(),
-            ..WebDavSyncSettings::default()
-        }))
-        .expect("seed enabled webdav settings");
-
-        let settings =
-            require_enabled_webdav_settings().expect("enabled settings should be accepted");
-        assert!(settings.enabled);
-        assert_eq!(settings.base_url, "https://dav.example.com/dav/");
     }
 }

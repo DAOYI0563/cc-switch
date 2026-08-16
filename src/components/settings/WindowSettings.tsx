@@ -1,9 +1,7 @@
-import { useTranslation } from "react-i18next";
-import type { SettingsFormState } from "@/hooks/useSettings";
-import { AppWindow, MonitorUp, Power, EyeOff } from "lucide-react";
+import { AppWindow, EyeOff, Power } from "lucide-react";
+
 import { ToggleRow } from "@/components/ui/toggle-row";
-import { AnimatePresence, motion } from "framer-motion";
-import { isLinux } from "@/lib/platform";
+import type { SettingsFormState } from "@/hooks/useSettings";
 
 interface WindowSettingsProps {
   settings: SettingsFormState;
@@ -11,83 +9,29 @@ interface WindowSettingsProps {
 }
 
 export function WindowSettings({ settings, onChange }: WindowSettingsProps) {
-  const { t } = useTranslation();
-
   return (
     <section className="space-y-4">
-      <div className="flex items-center gap-2 pb-2 border-b border-border/40">
+      <div className="flex items-center gap-2 border-b border-border-default pb-2">
         <AppWindow className="h-4 w-4 text-primary" />
-        <h3 className="text-sm font-medium">{t("settings.windowBehavior")}</h3>
+        <h3 className="text-sm font-medium">窗口与启动</h3>
       </div>
-
       <div className="space-y-3">
         <ToggleRow
-          icon={<Power className="h-4 w-4 text-orange-500" />}
-          title={t("settings.launchOnStartup")}
-          description={t("settings.launchOnStartupDescription")}
-          checked={!!settings.launchOnStartup}
+          icon={<Power className="h-4 w-4 text-emerald-600" />}
+          title="开机启动"
+          description="登录 Windows 后自动启动 WSL Code Switch。"
+          checked={Boolean(settings.launchOnStartup)}
           onCheckedChange={(value) => onChange({ launchOnStartup: value })}
         />
-
-        <AnimatePresence initial={false}>
-          {settings.launchOnStartup && (
-            <motion.div
-              key="silent-startup"
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 10 }}
-              transition={{ duration: 0.3 }}
-            >
-              <ToggleRow
-                icon={<EyeOff className="h-4 w-4 text-green-500" />}
-                title={t("settings.silentStartup")}
-                description={t("settings.silentStartupDescription")}
-                checked={!!settings.silentStartup}
-                onCheckedChange={(value) => onChange({ silentStartup: value })}
-              />
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        <ToggleRow
-          icon={<MonitorUp className="h-4 w-4 text-purple-500" />}
-          title={t("settings.enableClaudePluginIntegration")}
-          description={t("settings.enableClaudePluginIntegrationDescription")}
-          checked={!!settings.enableClaudePluginIntegration}
-          onCheckedChange={(value) =>
-            onChange({ enableClaudePluginIntegration: value })
-          }
-        />
-
-        <ToggleRow
-          icon={<MonitorUp className="h-4 w-4 text-cyan-500" />}
-          title={t("settings.skipClaudeOnboarding")}
-          description={t("settings.skipClaudeOnboardingDescription")}
-          checked={!!settings.skipClaudeOnboarding}
-          onCheckedChange={(value) => onChange({ skipClaudeOnboarding: value })}
-        />
-
-        <ToggleRow
-          icon={<AppWindow className="h-4 w-4 text-blue-500" />}
-          title={t("settings.minimizeToTray")}
-          description={t("settings.minimizeToTrayDescription")}
-          checked={settings.minimizeToTrayOnClose}
-          onCheckedChange={(value) =>
-            onChange({ minimizeToTrayOnClose: value })
-          }
-        />
-
-        {isLinux() && (
+        {settings.launchOnStartup ? (
           <ToggleRow
-            icon={<AppWindow className="h-4 w-4 text-amber-500" />}
-            title={t("settings.useAppWindowControls")}
-            description={t("settings.useAppWindowControlsDescription")}
-            checked={!!settings.useAppWindowControls}
-            onCheckedChange={(value) =>
-              onChange({ useAppWindowControls: value })
-            }
+            icon={<EyeOff className="h-4 w-4 text-blue-600" />}
+            title="静默启动"
+            description="开机启动后保持窗口隐藏，只显示托盘图标。"
+            checked={Boolean(settings.silentStartup)}
+            onCheckedChange={(value) => onChange({ silentStartup: value })}
           />
-        )}
+        ) : null}
       </div>
     </section>
   );

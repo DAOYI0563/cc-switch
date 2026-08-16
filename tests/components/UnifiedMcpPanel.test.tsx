@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   bulkToggle: vi.fn(),
   deleteServer: vi.fn(),
   importServers: vi.fn(),
+  syncServers: vi.fn(),
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
 }));
@@ -40,6 +41,10 @@ vi.mock("@/hooks/useMcp", () => ({
   }),
   useDeleteMcpServer: () => ({ mutateAsync: mocks.deleteServer }),
   useImportMcpFromApps: () => ({ mutateAsync: mocks.importServers }),
+  useSyncMcpToApps: () => ({
+    mutateAsync: mocks.syncServers,
+    isPending: false,
+  }),
 }));
 
 vi.mock("@/components/mcp/McpFormModal", () => ({
@@ -72,11 +77,7 @@ function makeServer(id: string, overrides: ServerOverrides = {}): McpServer {
     apps: {
       claude: false,
       codex: false,
-      gemini: false,
-      grokbuild: false,
       opencode: false,
-      openclaw: false,
-      hermes: false,
       ...apps,
     },
   } as McpServer;
@@ -103,6 +104,7 @@ describe("UnifiedMcpPanel", () => {
     mocks.bulkToggle.mockReset();
     mocks.deleteServer.mockReset();
     mocks.importServers.mockReset();
+    mocks.syncServers.mockReset();
     mocks.toastError.mockReset();
     mocks.toastSuccess.mockReset();
     mocks.toggle.mockResolvedValue(undefined);

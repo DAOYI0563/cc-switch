@@ -1,0 +1,28 @@
+pub mod ai_summary;
+pub mod device_settings;
+pub mod legacy_data;
+pub mod live_provider_config;
+pub mod local_conflict_resolution;
+pub mod local_protection;
+pub mod local_reconciliation_state;
+pub mod local_scan_parser;
+pub mod local_scan_summary;
+pub mod local_skill_tree;
+pub mod mcp_live_files;
+pub mod prompt_live_file;
+pub mod retained_http;
+pub mod secret_store;
+pub mod sync_crypto;
+pub mod sync_local;
+pub mod sync_webdav;
+pub mod temporary_rollback;
+pub mod wsl_files;
+pub(crate) mod wsl_path_guard;
+pub mod wsl_paths;
+
+pub use ai_summary::DirectOpenAiSummaryClient;
+pub use local_protection::WindowsDpapiProtector;
+pub use secret_store::WindowsCredentialStore;
+pub use sync_crypto::{FixedSyncCryptoEngine, SystemSyncCryptoRandom};
+pub use sync_local::RuntimeSyncLocalAdapter;
+pub use sync_webdav::{ReqwestSyncWebDavTransport, SyncWebDavTransportOptions};

@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import PromptPanel, {
   type PromptPanelHandle,
 } from "@/components/prompts/PromptPanel";
-import type { AppId, Prompt } from "@/lib/api";
+import type { ManagedAppId, Prompt } from "@/lib/api";
 
 const mocks = vi.hoisted(() => ({
   state: {
@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
         name: string;
         content: string;
         description?: string;
+        version: number;
         enabled: boolean;
       }
     >,
@@ -32,6 +33,9 @@ const mocks = vi.hoisted(() => ({
   savePrompt: vi.fn(),
   deletePrompt: vi.fn(),
   toggleEnabled: vi.fn(),
+  importFromFile: vi.fn(),
+  syncToLive: vi.fn(),
+  useTauriEvent: vi.fn(),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -42,24 +46,27 @@ vi.mock("react-i18next", () => ({
       if (key === "prompts.confirm.deleteMessage") {
         return `${key}:${options?.name}`;
       }
+      if (key === "prompts.version") return `${key}:${options?.version}`;
       return key;
     },
   }),
 }));
 
 vi.mock("@/hooks/usePromptActions", () => ({
-  usePromptActions: (appId: AppId) => ({
+  usePromptActions: (appId: ManagedAppId) => ({
     prompts: mocks.state.prompts,
     loading: mocks.state.loading,
     reload: mocks.getReload(appId),
     savePrompt: mocks.savePrompt,
     deletePrompt: mocks.deletePrompt,
     toggleEnabled: mocks.toggleEnabled,
+    importFromFile: mocks.importFromFile,
+    syncToLive: mocks.syncToLive,
   }),
 }));
 
 vi.mock("@/hooks/useTauriEvent", () => ({
-  useTauriEvent: vi.fn(),
+  useTauriEvent: mocks.useTauriEvent,
 }));
 
 vi.mock("@/components/prompts/PromptFormPanel", () => ({
@@ -84,6 +91,7 @@ vi.mock("@/components/prompts/PromptFormPanel", () => ({
             initialData ?? {
               id: "new-prompt",
               name: "New Prompt",
+              version: 0,
               content: "New content",
               enabled: false,
             },
@@ -128,6 +136,7 @@ const createPrompts = () => ({
   "record-index-47": {
     id: "payload-identifier-92",
     name: "Aurora Prompt",
+    version: 4,
     description: "Contains the nebula phrase",
     content: "Follow the quasar instruction exactly.",
     enabled: true,
@@ -135,13 +144,14 @@ const createPrompts = () => ({
   "second-record": {
     id: "second-payload",
     name: "Harbor Prompt",
+    version: 2,
     description: "Deployment checklist",
     content: "Prepare the release notes.",
     enabled: false,
   },
 });
 
-function renderPanel(appId: AppId = "claude") {
+function renderPanel(appId: ManagedAppId = "claude") {
   return render(
     <PromptPanel open appId={appId} onOpenChange={() => undefined} />,
   );
@@ -174,6 +184,11 @@ describe("PromptPanel", () => {
     mocks.deletePrompt.mockResolvedValue(true);
     mocks.toggleEnabled.mockReset();
     mocks.toggleEnabled.mockResolvedValue(true);
+    mocks.importFromFile.mockReset();
+    mocks.importFromFile.mockResolvedValue(true);
+    mocks.syncToLive.mockReset();
+    mocks.syncToLive.mockResolvedValue(true);
+    mocks.useTauriEvent.mockReset();
   });
 
   it.each([
@@ -257,6 +272,44 @@ describe("PromptPanel", () => {
     expect(summary).toHaveTextContent("prompts.count:2");
     expect(summary).toHaveTextContent("prompts.enabledName:Aurora Prompt");
     expect(screen.queryByText("Aurora Prompt")).not.toBeInTheDocument();
+  });
+
+  it("shows the authoritative version number for each record", async () => {
+    renderPanel();
+    await waitForPanelReady();
+
+    expect(screen.getByText("prompts.version:4")).toBeInTheDocument();
+    expect(screen.getByText("prompts.version:2")).toBeInTheDocument();
+  });
+
+  it("imports from the selected client and confirms before syncing to live", async () => {
+    const ref = createRef<PromptPanelHandle>();
+    render(
+      <PromptPanel
+        ref={ref}
+        open
+        appId="opencode"
+        onOpenChange={() => undefined}
+      />,
+    );
+    await waitForPanelReady();
+
+    await act(async () => ref.current?.importFromLive());
+    expect(mocks.importFromFile).toHaveBeenCalledTimes(1);
+
+    act(() => ref.current?.syncToLive());
+    expect(mocks.syncToLive).not.toHaveBeenCalled();
+    expect(screen.getByText("prompts.confirm.syncMessage")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "confirm-dialog" }));
+    await waitFor(() => expect(mocks.syncToLive).toHaveBeenCalledTimes(1));
+  });
+
+  it("does not subscribe to deleted Deep Link or Profile events", async () => {
+    renderPanel();
+    await waitForPanelReady();
+
+    expect(mocks.useTauriEvent).not.toHaveBeenCalled();
   });
 
   it("preserves record IDs for filtered toggle, edit, and delete actions", async () => {
@@ -373,8 +426,8 @@ describe("PromptPanel", () => {
     expect(mocks.deletePrompt).not.toHaveBeenCalled();
   });
 
-  it("queues external reloads until the active write finishes", async () => {
-    renderPanel();
+  it("queues page-entry reloads until the active write finishes", async () => {
+    const view = renderPanel();
     await waitForPanelReady();
     expect(mocks.reload).toHaveBeenCalledTimes(1);
     mocks.reload.mockClear();
@@ -387,14 +440,16 @@ describe("PromptPanel", () => {
     );
     fireEvent.click(screen.getAllByRole("switch")[0]);
 
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent("prompt-imported", { detail: { app: "claude" } }),
-      );
-      window.dispatchEvent(
-        new CustomEvent("prompt-imported", { detail: { app: "claude" } }),
-      );
-    });
+    view.rerender(
+      <PromptPanel
+        open={false}
+        appId="claude"
+        onOpenChange={() => undefined}
+      />,
+    );
+    view.rerender(
+      <PromptPanel open appId="claude" onOpenChange={() => undefined} />,
+    );
     expect(mocks.reload).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -475,17 +530,22 @@ describe("PromptPanel", () => {
     expect(onNavigationBlockedChange).toHaveBeenLastCalledWith(false);
   });
 
-  it("queues external reloads while an edit or confirmation is open", async () => {
-    renderPanel();
+  it("queues page-entry reloads while an edit or confirmation is open", async () => {
+    const view = renderPanel();
     await waitForPanelReady();
     mocks.reload.mockClear();
 
     fireEvent.click(screen.getAllByTitle("common.edit")[0]);
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent("prompt-imported", { detail: { app: "claude" } }),
-      );
-    });
+    view.rerender(
+      <PromptPanel
+        open={false}
+        appId="claude"
+        onOpenChange={() => undefined}
+      />,
+    );
+    view.rerender(
+      <PromptPanel open appId="claude" onOpenChange={() => undefined} />,
+    );
     expect(mocks.reload).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "form-close" }));
@@ -494,11 +554,16 @@ describe("PromptPanel", () => {
     await waitForPanelReady();
 
     fireEvent.click(screen.getAllByTitle("common.delete")[0]);
-    act(() => {
-      window.dispatchEvent(
-        new CustomEvent("prompt-imported", { detail: { app: "claude" } }),
-      );
-    });
+    view.rerender(
+      <PromptPanel
+        open={false}
+        appId="claude"
+        onOpenChange={() => undefined}
+      />,
+    );
+    view.rerender(
+      <PromptPanel open appId="claude" onOpenChange={() => undefined} />,
+    );
     expect(mocks.reload).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "cancel-dialog" }));
@@ -514,7 +579,7 @@ describe("PromptPanel", () => {
         }),
     );
     const codexReload = vi.fn().mockResolvedValue(undefined);
-    mocks.getReload.mockImplementation((appId: AppId) =>
+    mocks.getReload.mockImplementation((appId: ManagedAppId) =>
       appId === "codex" ? codexReload : claudeReload,
     );
 
@@ -639,7 +704,7 @@ describe("PromptPanel", () => {
     expect(screen.getByRole("dialog")).toBeInTheDocument();
 
     view.rerender(
-      <PromptPanel open appId="gemini" onOpenChange={() => undefined} />,
+      <PromptPanel open appId="opencode" onOpenChange={() => undefined} />,
     );
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();

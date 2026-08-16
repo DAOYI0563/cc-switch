@@ -10,8 +10,8 @@ export interface FetchedModel {
 /**
  * 从供应商获取可用模型列表
  *
- * 使用 OpenAI 兼容的 GET /v1/models 端点。优先用 `modelsUrl` 精确覆写；
- * 否则后端会对 baseURL 生成候选列表并按序尝试（含"剥离 /anthropic 等兼容子路径"兜底）。
+ * 使用 OpenAI 兼容的 GET /models 端点。优先用 `modelsUrl` 精确覆写；
+ * 否则后端只从当前 Base URL 确定一个地址并请求一次。
  */
 export async function fetchModelsForConfig(
   baseUrl: string,
@@ -34,31 +34,9 @@ export interface OpenCodeModelRef {
   modelId: string;
 }
 
-/** 获取 OpenCode 当前运行时可用模型（包含 OAuth 与 Zen 免费模型）。 */
+/** 获取 OpenCode 当前运行时可用模型。 */
 export async function getOpenCodeModels(): Promise<OpenCodeModelRef[]> {
   return invoke("get_opencode_models");
-}
-
-/**
- * 获取 Codex OAuth (ChatGPT Plus/Pro 反代) 可用模型列表
- *
- * Codex OAuth 使用 ChatGPT 的 backend-api/codex 端点，不兼容普通 /v1/models。
- */
-export async function fetchCodexOauthModels(
-  accountId?: string | null,
-): Promise<FetchedModel[]> {
-  return invoke("get_codex_oauth_models", {
-    accountId: accountId || null,
-  });
-}
-
-/** 获取当前 xAI OAuth 账号可访问的模型列表。 */
-export async function fetchXaiOauthModels(
-  accountId?: string | null,
-): Promise<FetchedModel[]> {
-  return invoke("get_xai_oauth_models", {
-    accountId: accountId || null,
-  });
 }
 
 /**
@@ -88,11 +66,6 @@ export function showFetchModelsError(
 
   if (msg.includes("HTTP 401") || msg.includes("HTTP 403")) {
     toast.error(t("providerForm.fetchModelsAuthFailed"));
-    return;
-  }
-  // 所有候选端点均返回 404/405：供应商可能未开放 /models 接口，或 Base URL 有误
-  if (msg.includes("All candidates failed")) {
-    toast.error(t("providerForm.fetchModelsEndpointNotFound"));
     return;
   }
   if (msg.includes("HTTP 404") || msg.includes("HTTP 405")) {

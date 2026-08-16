@@ -2,9 +2,13 @@ pub mod providers;
 pub mod terminal;
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::cmp::Reverse;
+use std::path::Path;
 
-use providers::{claude, codex, gemini, grokbuild, hermes, openclaw, opencode};
+use providers::{claude, codex, opencode};
+
+const DEFAULT_PAGE_SIZE: usize = 50;
+const MAX_PAGE_SIZE: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -21,7 +25,7 @@ pub struct SessionMeta {
     pub created_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_command: Option<String>,
@@ -36,324 +40,461 @@ pub struct SessionMessage {
     pub ts: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteSessionRequest {
-    pub provider_id: String,
-    pub session_id: String,
-    pub source_path: String,
+pub struct NormalizedSessionEvent {
+    pub sequence: usize,
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DeleteSessionOutcome {
-    pub provider_id: String,
-    pub session_id: String,
-    pub source_path: String,
-    pub success: bool,
+pub struct SessionPage<T> {
+    pub items: Vec<T>,
+    pub offset: usize,
+    pub total: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSearchRequest {
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub from_ms: Option<i64>,
+    #[serde(default)]
+    pub to_ms: Option<i64>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+pub trait SessionSource: Send + Sync {
+    fn provider_id(&self) -> &'static str;
+    fn scan(&self) -> Vec<SessionMeta>;
+    fn read_messages(&self, source_path: &str) -> Result<Vec<SessionMessage>, String>;
+}
+
+struct ClaudeSessionSource;
+struct CodexSessionSource;
+struct OpenCodeSessionSource;
+
+impl SessionSource for ClaudeSessionSource {
+    fn provider_id(&self) -> &'static str {
+        "claude"
+    }
+
+    fn scan(&self) -> Vec<SessionMeta> {
+        claude::scan_sessions()
+    }
+
+    fn read_messages(&self, source_path: &str) -> Result<Vec<SessionMessage>, String> {
+        claude::load_messages(Path::new(source_path))
+    }
+}
+
+impl SessionSource for CodexSessionSource {
+    fn provider_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn scan(&self) -> Vec<SessionMeta> {
+        codex::scan_sessions()
+    }
+
+    fn read_messages(&self, source_path: &str) -> Result<Vec<SessionMessage>, String> {
+        codex::load_messages(Path::new(source_path))
+    }
+}
+
+impl SessionSource for OpenCodeSessionSource {
+    fn provider_id(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn scan(&self) -> Vec<SessionMeta> {
+        opencode::scan_sessions()
+    }
+
+    fn read_messages(&self, source_path: &str) -> Result<Vec<SessionMessage>, String> {
+        if source_path.starts_with("sqlite:") {
+            opencode::load_messages_sqlite(source_path)
+        } else {
+            opencode::load_messages(Path::new(source_path))
+        }
+    }
+}
+
+fn managed_sources() -> Vec<Box<dyn SessionSource>> {
+    vec![
+        Box::new(ClaudeSessionSource),
+        Box::new(CodexSessionSource),
+        Box::new(OpenCodeSessionSource),
+    ]
 }
 
 pub fn scan_sessions() -> Vec<SessionMeta> {
-    let (r1, r2, r3, r4, r5, r6, r7) = std::thread::scope(|s| {
-        let h1 = s.spawn(codex::scan_sessions);
-        let h2 = s.spawn(claude::scan_sessions);
-        let h3 = s.spawn(opencode::scan_sessions);
-        let h4 = s.spawn(openclaw::scan_sessions);
-        let h5 = s.spawn(gemini::scan_sessions);
-        let h6 = s.spawn(hermes::scan_sessions);
-        let h7 = s.spawn(grokbuild::scan_sessions);
-        (
-            h1.join().unwrap_or_default(),
-            h2.join().unwrap_or_default(),
-            h3.join().unwrap_or_default(),
-            h4.join().unwrap_or_default(),
-            h5.join().unwrap_or_default(),
-            h6.join().unwrap_or_default(),
-            h7.join().unwrap_or_default(),
-        )
-    });
+    scan_sessions_from(&managed_sources())
+}
 
+fn scan_sessions_from(sources: &[Box<dyn SessionSource>]) -> Vec<SessionMeta> {
     let mut sessions = Vec::new();
-    sessions.extend(r1);
-    sessions.extend(r2);
-    sessions.extend(r3);
-    sessions.extend(r4);
-    sessions.extend(r5);
-    sessions.extend(r6);
-    sessions.extend(r7);
-
-    sessions.sort_by(|a, b| {
-        let a_ts = a.last_active_at.or(a.created_at).unwrap_or(0);
-        let b_ts = b.last_active_at.or(b.created_at).unwrap_or(0);
-        b_ts.cmp(&a_ts)
-    });
-
+    for source in sources {
+        sessions.extend(
+            source
+                .scan()
+                .into_iter()
+                .filter(|session| session.provider_id == source.provider_id()),
+        );
+    }
+    sessions.sort_by_key(|session| Reverse(session_timestamp(session)));
     sessions
 }
 
-pub fn load_messages(provider_id: &str, source_path: &str) -> Result<Vec<SessionMessage>, String> {
-    // SQLite sessions use a "sqlite:" prefixed source_path
-    if provider_id == "opencode" && source_path.starts_with("sqlite:") {
-        return opencode::load_messages_sqlite(source_path);
-    }
-    if provider_id == "hermes" && source_path.starts_with("sqlite:") {
-        return hermes::load_messages_sqlite(source_path);
-    }
-
-    let path = Path::new(source_path);
-    match provider_id {
-        "codex" => codex::load_messages(path),
-        "claude" => claude::load_messages(path),
-        "opencode" => opencode::load_messages(path),
-        "openclaw" => openclaw::load_messages(path),
-        "gemini" => gemini::load_messages(path),
-        "grokbuild" => grokbuild::load_messages(path),
-        "hermes" => hermes::load_messages(path),
-        _ => Err(format!("Unsupported provider: {provider_id}")),
-    }
+pub fn search_sessions(request: &SessionSearchRequest) -> Result<SessionPage<SessionMeta>, String> {
+    search_sessions_from(&managed_sources(), request)
 }
 
-pub fn delete_session(
-    provider_id: &str,
-    session_id: &str,
-    source_path: &str,
-) -> Result<bool, String> {
-    // SQLite sessions bypass the file-based deletion path
-    if provider_id == "opencode" && source_path.starts_with("sqlite:") {
-        return opencode::delete_session_sqlite(session_id, source_path);
-    }
-    if provider_id == "hermes" && source_path.starts_with("sqlite:") {
-        return hermes::delete_session_sqlite(session_id, source_path);
-    }
+fn search_sessions_from(
+    sources: &[Box<dyn SessionSource>],
+    request: &SessionSearchRequest,
+) -> Result<SessionPage<SessionMeta>, String> {
+    validate_search_request(request)?;
+    let project = normalized_filter(request.project.as_deref());
+    let keyword = normalized_filter(request.keyword.as_deref());
+    let mut matches = Vec::new();
 
-    let roots = provider_roots(provider_id)?;
-    delete_session_with_roots(provider_id, session_id, Path::new(source_path), &roots)
-}
-
-pub fn delete_sessions(requests: &[DeleteSessionRequest]) -> Vec<DeleteSessionOutcome> {
-    collect_delete_session_outcomes(requests, |request| {
-        delete_session(
-            &request.provider_id,
-            &request.session_id,
-            &request.source_path,
-        )
-    })
-}
-
-fn delete_session_with_roots(
-    provider_id: &str,
-    session_id: &str,
-    source_path: &Path,
-    roots: &[PathBuf],
-) -> Result<bool, String> {
-    let validated_source = canonicalize_existing_path(source_path, "session source")?;
-
-    let mut saw_existing_root = false;
-    for root in roots {
-        if !root.exists() {
+    for source in sources {
+        if request
+            .provider_id
+            .as_deref()
+            .is_some_and(|provider_id| provider_id != "all" && provider_id != source.provider_id())
+        {
             continue;
         }
 
-        saw_existing_root = true;
-        let validated_root = canonicalize_existing_path(root, "session root")?;
-        if validated_source.starts_with(&validated_root) {
-            return match provider_id {
-                "codex" => codex::delete_session(&validated_root, &validated_source, session_id),
-                "claude" => claude::delete_session(&validated_root, &validated_source, session_id),
-                "opencode" => {
-                    opencode::delete_session(&validated_root, &validated_source, session_id)
+        for session in source.scan() {
+            if session.provider_id != source.provider_id() {
+                continue;
+            }
+            let timestamp = session_timestamp(&session);
+            if request.from_ms.is_some_and(|from| timestamp < from)
+                || request.to_ms.is_some_and(|to| timestamp > to)
+            {
+                continue;
+            }
+            if project.as_ref().is_some_and(|needle| {
+                !session
+                    .project_dir
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(needle)
+            }) {
+                continue;
+            }
+            if let Some(needle) = keyword.as_ref() {
+                let metadata = [
+                    session.session_id.as_str(),
+                    session.title.as_deref().unwrap_or_default(),
+                    session.summary.as_deref().unwrap_or_default(),
+                    session.project_dir.as_deref().unwrap_or_default(),
+                ]
+                .join(" ")
+                .to_lowercase();
+                let content_match = if metadata.contains(needle) {
+                    true
+                } else {
+                    session
+                        .source_path
+                        .as_deref()
+                        .and_then(|path| source.read_messages(path).ok())
+                        .is_some_and(|events| {
+                            events
+                                .iter()
+                                .any(|event| event.content.to_lowercase().contains(needle))
+                        })
+                };
+                if !content_match {
+                    continue;
                 }
-                "openclaw" => {
-                    openclaw::delete_session(&validated_root, &validated_source, session_id)
-                }
-                "gemini" => gemini::delete_session(&validated_root, &validated_source, session_id),
-                "grokbuild" => {
-                    grokbuild::delete_session(&validated_root, &validated_source, session_id)
-                }
-                "hermes" => hermes::delete_session(&validated_root, &validated_source, session_id),
-                _ => Err(format!("Unsupported provider: {provider_id}")),
-            };
+            }
+            matches.push(session);
         }
     }
 
-    if !saw_existing_root {
+    matches.sort_by_key(|session| Reverse(session_timestamp(session)));
+    Ok(page(matches, request.offset, page_limit(request.limit)?))
+}
+
+pub fn load_messages_page(
+    provider_id: &str,
+    session_id: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<SessionPage<NormalizedSessionEvent>, String> {
+    let sources = managed_sources();
+    let source = sources
+        .iter()
+        .find(|source| source.provider_id() == provider_id)
+        .ok_or_else(|| format!("Unsupported provider: {provider_id}"))?;
+    let session = source
+        .scan()
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    let source_path = session
+        .source_path
+        .as_deref()
+        .ok_or_else(|| "Session source is unavailable".to_string())?;
+    let events = source
+        .read_messages(source_path)?
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, message)| NormalizedSessionEvent {
+            sequence,
+            role: message.role,
+            content: message.content,
+            occurred_at: message.ts,
+        })
+        .collect();
+    Ok(page(events, offset, page_limit(limit)?))
+}
+
+pub fn find_session(provider_id: &str, session_id: &str) -> Result<SessionMeta, String> {
+    let sources = managed_sources();
+    let source = sources
+        .iter()
+        .find(|source| source.provider_id() == provider_id)
+        .ok_or_else(|| format!("Unsupported provider: {provider_id}"))?;
+    source
+        .scan()
+        .into_iter()
+        .find(|session| session.session_id == session_id)
+        .ok_or_else(|| "Session not found".to_string())
+}
+
+pub fn collect_brief_events(
+    from_ms: i64,
+    to_ms: i64,
+) -> Result<Vec<crate::domain::BriefInputEvent>, String> {
+    if from_ms > to_ms {
+        return Err("Brief session range is invalid".to_string());
+    }
+    let mut events = Vec::new();
+    for source in managed_sources() {
+        for session in source.scan() {
+            let fallback_timestamp = session_timestamp(&session);
+            let session_started = session.created_at.unwrap_or(fallback_timestamp);
+            if session_started > to_ms || fallback_timestamp < from_ms {
+                continue;
+            }
+            let source_path = session
+                .source_path
+                .as_deref()
+                .ok_or_else(|| format!("Session {} has no readable source", session.session_id))?;
+            let messages = source
+                .read_messages(source_path)
+                .map_err(|_| format!("Session {} could not be read", session.session_id))?;
+            for message in messages {
+                let occurred_at_ms = message.ts.unwrap_or(fallback_timestamp);
+                if occurred_at_ms < from_ms || occurred_at_ms > to_ms {
+                    continue;
+                }
+                events.push(crate::domain::BriefInputEvent {
+                    client: session.provider_id.clone(),
+                    session_id: session.session_id.clone(),
+                    project: session.project_dir.clone().unwrap_or_default(),
+                    occurred_at_ms,
+                    role: message.role,
+                    content: message.content,
+                });
+            }
+        }
+    }
+    events.sort_by(|left, right| {
+        left.occurred_at_ms
+            .cmp(&right.occurred_at_ms)
+            .then_with(|| left.client.cmp(&right.client))
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    Ok(events)
+}
+
+fn validate_search_request(request: &SessionSearchRequest) -> Result<(), String> {
+    if let (Some(from), Some(to)) = (request.from_ms, request.to_ms) {
+        if from > to {
+            return Err("Session date range is invalid".to_string());
+        }
+    }
+    if let Some(provider_id) = request.provider_id.as_deref() {
+        if !matches!(provider_id, "all" | "claude" | "codex" | "opencode") {
+            return Err(format!("Unsupported provider: {provider_id}"));
+        }
+    }
+    page_limit(request.limit).map(|_| ())
+}
+
+fn normalized_filter(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+}
+
+fn page_limit(limit: Option<usize>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
         return Err(format!(
-            "Session root not found for provider {provider_id}: {}",
-            roots
-                .first()
-                .map(|root| root.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string())
+            "Session page size must be between 1 and {MAX_PAGE_SIZE}"
         ));
     }
-
-    Err(format!(
-        "Session source path is outside provider roots: {}",
-        source_path.display()
-    ))
+    Ok(limit)
 }
 
-fn provider_roots(provider_id: &str) -> Result<Vec<PathBuf>, String> {
-    let roots = match provider_id {
-        "codex" => codex::session_roots(),
-        "claude" => vec![crate::config::get_claude_config_dir().join("projects")],
-        "opencode" => vec![opencode::get_opencode_data_dir()],
-        "openclaw" => vec![crate::openclaw_config::get_openclaw_dir().join("agents")],
-        "gemini" => vec![crate::gemini_config::get_gemini_dir().join("tmp")],
-        "grokbuild" => grokbuild::session_roots(),
-        "hermes" => vec![crate::hermes_config::get_hermes_dir().join("sessions")],
-        _ => return Err(format!("Unsupported provider: {provider_id}")),
+fn page<T>(items: Vec<T>, offset: usize, limit: usize) -> SessionPage<T> {
+    let total = items.len();
+    let end = offset.saturating_add(limit).min(total);
+    let items = if offset >= total {
+        Vec::new()
+    } else {
+        items.into_iter().skip(offset).take(limit).collect()
     };
-
-    Ok(roots)
-}
-
-fn canonicalize_existing_path(path: &Path, label: &str) -> Result<PathBuf, String> {
-    if !path.exists() {
-        return Err(format!("{label} not found: {}", path.display()));
+    SessionPage {
+        items,
+        offset,
+        total,
+        next_offset: (end < total).then_some(end),
     }
-
-    path.canonicalize()
-        .map_err(|e| format!("Failed to resolve {label} {}: {e}", path.display()))
 }
 
-fn collect_delete_session_outcomes<F>(
-    requests: &[DeleteSessionRequest],
-    mut deleter: F,
-) -> Vec<DeleteSessionOutcome>
-where
-    F: FnMut(&DeleteSessionRequest) -> Result<bool, String>,
-{
-    requests
-        .iter()
-        .map(|request| match deleter(request) {
-            Ok(true) => DeleteSessionOutcome {
-                provider_id: request.provider_id.clone(),
-                session_id: request.session_id.clone(),
-                source_path: request.source_path.clone(),
-                success: true,
-                error: None,
-            },
-            Ok(false) => DeleteSessionOutcome {
-                provider_id: request.provider_id.clone(),
-                session_id: request.session_id.clone(),
-                source_path: request.source_path.clone(),
-                success: false,
-                error: Some("Session was not deleted".to_string()),
-            },
-            Err(error) => DeleteSessionOutcome {
-                provider_id: request.provider_id.clone(),
-                session_id: request.session_id.clone(),
-                source_path: request.source_path.clone(),
-                success: false,
-                error: Some(error),
-            },
-        })
-        .collect()
+fn session_timestamp(session: &SessionMeta) -> i64 {
+    session.last_active_at.or(session.created_at).unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn write_codex_session(path: &Path, session_id: &str) {
-        std::fs::write(
-            path,
-            format!(
-                "{{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{session_id}\",\"cwd\":\"/tmp/project\"}}}}\n\
-                 {{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}}}}\n",
-            ),
-        )
-        .expect("write source");
+    struct FixtureSource {
+        provider_id: &'static str,
+        sessions: Vec<SessionMeta>,
+        messages: Vec<SessionMessage>,
+    }
+
+    impl SessionSource for FixtureSource {
+        fn provider_id(&self) -> &'static str {
+            self.provider_id
+        }
+
+        fn scan(&self) -> Vec<SessionMeta> {
+            self.sessions.clone()
+        }
+
+        fn read_messages(&self, _source_path: &str) -> Result<Vec<SessionMessage>, String> {
+            Ok(self.messages.clone())
+        }
+    }
+
+    fn fixture_session(id: &str, project: &str, timestamp: i64) -> SessionMeta {
+        SessionMeta {
+            provider_id: "claude".to_string(),
+            session_id: id.to_string(),
+            title: Some(format!("title {id}")),
+            summary: None,
+            project_dir: Some(project.to_string()),
+            created_at: Some(timestamp),
+            last_active_at: Some(timestamp),
+            source_path: Some(format!("/{id}.jsonl")),
+            resume_command: Some(format!("claude --resume {id}")),
+        }
     }
 
     #[test]
-    fn accepts_source_path_under_any_allowed_provider_root() {
-        let active_root = tempdir().expect("active root");
-        let archived_root = tempdir().expect("archived root");
-        let source = archived_root.path().join("session.jsonl");
-        write_codex_session(&source, "archived-session");
-
-        let deleted = delete_session_with_roots(
-            "codex",
-            "archived-session",
-            &source,
-            &[
-                active_root.path().to_path_buf(),
-                archived_root.path().to_path_buf(),
+    fn search_filters_content_and_paginates_without_exposing_source_paths() {
+        let sources: Vec<Box<dyn SessionSource>> = vec![Box::new(FixtureSource {
+            provider_id: "claude",
+            sessions: vec![
+                fixture_session("old", "/work/a", 100),
+                fixture_session("new", "/work/b", 200),
             ],
+            messages: vec![SessionMessage {
+                role: "user".to_string(),
+                content: "needle in original session".to_string(),
+                ts: Some(200),
+            }],
+        })];
+        let result = search_sessions_from(
+            &sources,
+            &SessionSearchRequest {
+                keyword: Some("needle".to_string()),
+                offset: 0,
+                limit: Some(1),
+                ..SessionSearchRequest::default()
+            },
         )
-        .expect("delete archived session");
+        .expect("search");
 
-        assert!(deleted);
-        assert!(!source.exists());
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.total, 2);
+        assert_eq!(result.next_offset, Some(1));
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert!(json.to_string().find("sourcePath").is_none());
     }
 
     #[test]
-    fn rejects_source_path_outside_provider_root() {
-        let root = tempdir().expect("tempdir");
-        let outside = tempdir().expect("tempdir");
-        let source = outside.path().join("session.jsonl");
-        std::fs::write(&source, "{}").expect("write source");
-
-        let err =
-            delete_session_with_roots("codex", "session-1", &source, &[root.path().to_path_buf()])
-                .expect_err("expected outside-root path to be rejected");
-
-        assert!(err.contains("outside provider roots"));
+    fn search_rejects_non_target_clients_and_invalid_ranges() {
+        let sources: Vec<Box<dyn SessionSource>> = Vec::new();
+        for request in [
+            SessionSearchRequest {
+                provider_id: Some("gemini".to_string()),
+                ..SessionSearchRequest::default()
+            },
+            SessionSearchRequest {
+                from_ms: Some(20),
+                to_ms: Some(10),
+                ..SessionSearchRequest::default()
+            },
+        ] {
+            assert!(search_sessions_from(&sources, &request).is_err());
+        }
     }
 
     #[test]
-    fn rejects_missing_source_path() {
-        let root = tempdir().expect("tempdir");
-        let missing = root.path().join("missing.jsonl");
+    fn active_session_manager_is_read_only_and_three_client_only() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(production, _)| production)
+            .expect("session manager test boundary");
 
-        let err =
-            delete_session_with_roots("codex", "session-1", &missing, &[root.path().to_path_buf()])
-                .expect_err("expected missing source path to fail");
-
-        assert!(err.contains("session source not found"));
-    }
-
-    #[test]
-    fn batch_delete_collects_successes_and_failures_in_order() {
-        let requests = vec![
-            DeleteSessionRequest {
-                provider_id: "codex".to_string(),
-                session_id: "s1".to_string(),
-                source_path: "/tmp/s1".to_string(),
-            },
-            DeleteSessionRequest {
-                provider_id: "claude".to_string(),
-                session_id: "s2".to_string(),
-                source_path: "/tmp/s2".to_string(),
-            },
-            DeleteSessionRequest {
-                provider_id: "gemini".to_string(),
-                session_id: "s3".to_string(),
-                source_path: "/tmp/s3".to_string(),
-            },
-        ];
-
-        let outcomes = collect_delete_session_outcomes(&requests, |request| {
-            match request.session_id.as_str() {
-                "s1" => Ok(true),
-                "s2" => Err("boom".to_string()),
-                _ => Ok(false),
-            }
-        });
-
-        assert_eq!(outcomes.len(), 3);
-        assert!(outcomes[0].success);
-        assert_eq!(outcomes[0].error, None);
-        assert!(!outcomes[1].success);
-        assert_eq!(outcomes[1].error.as_deref(), Some("boom"));
-        assert!(!outcomes[2].success);
-        assert_eq!(
-            outcomes[2].error.as_deref(),
-            Some("Session was not deleted")
-        );
+        for forbidden in [
+            "delete_session",
+            "remove_file",
+            "remove_dir_all",
+            "gemini::",
+            "grokbuild::",
+            "openclaw::",
+            "hermes::",
+        ] {
+            assert!(!production.contains(forbidden), "found {forbidden}");
+        }
+        for required in [
+            "ClaudeSessionSource",
+            "CodexSessionSource",
+            "OpenCodeSessionSource",
+        ] {
+            assert!(production.contains(required), "missing {required}");
+        }
     }
 }

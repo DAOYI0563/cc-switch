@@ -268,27 +268,7 @@ pub fn load_messages(path: &Path) -> Result<Vec<SessionMessage>, String> {
     Ok(messages)
 }
 
-pub fn delete_session(_root: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
-    let meta = parse_session(path)
-        .ok_or_else(|| format!("Failed to parse Codex session metadata: {}", path.display()))?;
-
-    if meta.session_id != session_id {
-        return Err(format!(
-            "Codex session ID mismatch: expected {session_id}, found {}",
-            meta.session_id
-        ));
-    }
-
-    std::fs::remove_file(path).map_err(|e| {
-        format!(
-            "Failed to delete Codex session file {}: {e}",
-            path.display()
-        )
-    })?;
-
-    Ok(true)
-}
-
+#[cfg(test)]
 fn parse_session(path: &Path) -> Option<SessionMeta> {
     parse_session_with_titles(path, &HashMap::new())
 }
@@ -561,27 +541,6 @@ mod tests {
 
         assert!(ids.contains(&"active-id".to_string()));
         assert!(ids.contains(&"archived-id".to_string()));
-    }
-
-    #[test]
-    fn delete_session_removes_jsonl_file() {
-        let temp = tempdir().expect("tempdir");
-        let path = temp
-            .path()
-            .join("rollout-2026-03-06T21-50-12-019cc369-bd7c-7891-b371-7b20b4fe0b18.jsonl");
-        std::fs::write(
-            &path,
-            concat!(
-                "{\"timestamp\":\"2026-03-06T21:50:12Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019cc369-bd7c-7891-b371-7b20b4fe0b18\",\"cwd\":\"/tmp/project\"}}\n",
-                "{\"timestamp\":\"2026-03-06T21:50:13Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}}\n"
-            ),
-        )
-        .expect("write session");
-
-        delete_session(temp.path(), &path, "019cc369-bd7c-7891-b371-7b20b4fe0b18")
-            .expect("delete session");
-
-        assert!(!path.exists());
     }
 
     #[test]

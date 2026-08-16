@@ -13,6 +13,39 @@ use crate::error::AppError;
 
 use super::validation::{extract_server_spec, validate_server_spec};
 
+fn read_codex_live_text() -> Result<Option<String>, AppError> {
+    crate::adapters::mcp_live_files::McpLiveFileAdapter::runtime()
+        .read_optional(crate::domain::ManagedClientId::Codex)?
+        .map(|contents| {
+            String::from_utf8(contents).map_err(|error| {
+                AppError::McpValidation(format!("config.toml 不是 UTF-8: {error}"))
+            })
+        })
+        .transpose()
+}
+
+fn write_codex_live_text(contents: &str) -> Result<(), AppError> {
+    crate::adapters::mcp_live_files::McpLiveFileAdapter::runtime()
+        .write(crate::domain::ManagedClientId::Codex, contents.as_bytes())
+}
+
+fn toml_value_to_json(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(value) => json!(value),
+        toml::Value::Integer(value) => json!(value),
+        toml::Value::Float(value) => json!(value),
+        toml::Value::Boolean(value) => json!(value),
+        toml::Value::Datetime(value) => json!(value.to_string()),
+        toml::Value::Array(values) => Value::Array(values.iter().map(toml_value_to_json).collect()),
+        toml::Value::Table(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_value_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn should_sync_codex_mcp() -> bool {
     // Codex 未安装/未初始化时：~/.codex 目录不存在。
     // 按用户偏好：目录缺失时跳过写入/删除，不创建任何文件或目录。
@@ -50,7 +83,7 @@ fn collect_enabled_servers(cfg: &McpConfig) -> HashMap<String, Value> {
 ///
 /// 已存在的服务器将启用 Codex 应用，不覆盖其他字段和应用状态
 pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError> {
-    let text = crate::codex_config::read_and_validate_codex_config_text()?;
+    let text = read_codex_live_text()?.unwrap_or_default();
     if text.trim().is_empty() {
         return Ok(0);
     }
@@ -158,56 +191,8 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
                     continue;
                 }
 
-                // 通用 TOML 值到 JSON 值转换
-                let json_val = match toml_val {
-                    toml::Value::String(s) => Some(json!(s)),
-                    toml::Value::Integer(i) => Some(json!(i)),
-                    toml::Value::Float(f) => Some(json!(f)),
-                    toml::Value::Boolean(b) => Some(json!(b)),
-                    toml::Value::Array(arr) => {
-                        // 只支持简单类型数组
-                        let json_arr: Vec<serde_json::Value> = arr
-                            .iter()
-                            .filter_map(|item| match item {
-                                toml::Value::String(s) => Some(json!(s)),
-                                toml::Value::Integer(i) => Some(json!(i)),
-                                toml::Value::Float(f) => Some(json!(f)),
-                                toml::Value::Boolean(b) => Some(json!(b)),
-                                _ => None,
-                            })
-                            .collect();
-                        if !json_arr.is_empty() {
-                            Some(serde_json::Value::Array(json_arr))
-                        } else {
-                            log::debug!("跳过复杂数组字段 '{key}' (TOML → JSON)");
-                            None
-                        }
-                    }
-                    toml::Value::Table(tbl) => {
-                        // 浅层表转为 JSON 对象（仅支持字符串值）
-                        let mut json_obj = serde_json::Map::new();
-                        for (k, v) in tbl.iter() {
-                            if let Some(s) = v.as_str() {
-                                json_obj.insert(k.clone(), json!(s));
-                            }
-                        }
-                        if !json_obj.is_empty() {
-                            Some(serde_json::Value::Object(json_obj))
-                        } else {
-                            log::debug!("跳过复杂对象字段 '{key}' (TOML → JSON)");
-                            None
-                        }
-                    }
-                    toml::Value::Datetime(_) => {
-                        log::debug!("跳过日期时间字段 '{key}' (TOML → JSON)");
-                        None
-                    }
-                };
-
-                if let Some(val) = json_val {
-                    spec.insert(key.clone(), val);
-                    log::debug!("导入扩展字段 '{key}'（值已省略）");
-                }
+                spec.insert(key.clone(), toml_value_to_json(toml_val));
+                log::debug!("导入扩展字段 '{key}'（值已省略）");
             }
 
             let spec_v = serde_json::Value::Object(spec);
@@ -236,10 +221,7 @@ pub fn import_from_codex(config: &mut MultiAppConfig) -> Result<usize, AppError>
                         apps: McpApps {
                             claude: false,
                             codex: true,
-                            gemini: false,
-                            grokbuild: false,
                             opencode: false,
-                            hermes: false,
                         },
                         description: None,
                         homepage: None,
@@ -293,7 +275,7 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
     let enabled = collect_enabled_servers(&config.mcp.codex);
 
     // 2) 读取现有 config.toml 文本；保持无效 TOML 的错误返回（不覆盖文件）
-    let base_text = crate::codex_config::read_and_validate_codex_config_text()?;
+    let base_text = read_codex_live_text()?.unwrap_or_default();
 
     // 3) 使用 toml_edit 解析（允许空文件）
     let mut doc = if base_text.trim().is_empty() {
@@ -341,9 +323,7 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
 
     // 6) 写回（仅改 TOML，不触碰 auth.json）；toml_edit 会尽量保留未改区域的注释/空白/顺序
     let new_text = doc.to_string();
-    let path = crate::codex_config::get_codex_config_path();
-    crate::config::write_text_file(&path, &new_text)?;
-    Ok(())
+    write_codex_live_text(&new_text)
 }
 
 /// 将单个 MCP 服务器同步到 Codex live 配置
@@ -375,7 +355,30 @@ fn upsert_mcp_server_table(
         .get_mut("mcp_servers")
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| AppError::McpValidation("config.toml 的 mcp_servers 不是表".to_string()))?;
-    servers.insert(id, toml_edit::Item::Table(table));
+    const MANAGED_FIELDS: &[&str] = &[
+        "type",
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "url",
+        "headers",
+        "http_headers",
+    ];
+
+    if let Some(existing) = servers
+        .get_mut(id)
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for field in MANAGED_FIELDS {
+            existing.remove(field);
+        }
+        for (key, value) in table.iter() {
+            existing.insert(key, value.clone());
+        }
+    } else {
+        servers.insert(id, toml_edit::Item::Table(table));
+    }
     Ok(())
 }
 
@@ -426,11 +429,7 @@ pub fn sync_single_server_to_codex(
     }
 
     // 读取现有的 config.toml
-    let config_path = crate::codex_config::get_codex_config_path();
-
-    let mut doc = if config_path.exists() {
-        let content =
-            std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
+    let mut doc = if let Some(content) = read_codex_live_text()? {
         // 解析失败必须报错而不是用空文档顶替：写回空文档会把用户
         // config.toml 里的其它段落（model/model_providers/注释等）整体清空
         content
@@ -456,9 +455,7 @@ pub fn sync_single_server_to_codex(
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
-
-    Ok(())
+    write_codex_live_text(&new_text)
 }
 
 /// 从 Codex live 配置中移除单个 MCP 服务器
@@ -467,133 +464,59 @@ pub fn remove_server_from_codex(id: &str) -> Result<(), AppError> {
     if !should_sync_codex_mcp() {
         return Ok(());
     }
-    let config_path = crate::codex_config::get_codex_config_path();
-
-    if !config_path.exists() {
+    let Some(content) = read_codex_live_text()? else {
         return Ok(()); // 文件不存在，无需删除
-    }
-
-    let content =
-        std::fs::read_to_string(&config_path).map_err(|e| AppError::io(&config_path, e))?;
-
-    // 尝试解析现有配置，如果失败则直接返回（无法删除不存在的内容）
-    let mut doc = match content.parse::<toml_edit::DocumentMut>() {
-        Ok(doc) => doc,
-        Err(e) => {
-            log::warn!("解析 Codex config.toml 失败: {e}，跳过删除操作");
-            return Ok(());
-        }
     };
+
+    let mut doc = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| AppError::McpValidation(format!("解析 config.toml 失败: {error}")))?;
 
     remove_mcp_server_from_doc(&mut doc, id);
 
     // 写回文件
     let new_text = doc.to_string();
-    crate::config::write_text_file(&config_path, &new_text)?;
-
-    Ok(())
+    write_codex_live_text(&new_text)
 }
 
 // ============================================================================
 // TOML 转换辅助函数
 // ============================================================================
 
-/// 通用 JSON 值到 TOML 值转换器（支持简单类型和浅层嵌套）
-///
-/// 支持的类型转换：
-/// - String → TOML String
-/// - Number (i64) → TOML Integer
-/// - Number (f64) → TOML Float
-/// - Boolean → TOML Boolean
-/// - Array[简单类型] → TOML Array
-/// - Object → TOML Inline Table (仅字符串值)
-///
-/// 不支持的类型（返回 None）：
-/// - null
-/// - 深度嵌套对象
-/// - 混合类型数组
+/// Structured JSON-to-TOML conversion for client extension fields. TOML has no
+/// null value, so null remains the only shape that cannot be represented.
 fn json_value_to_toml_item(value: &Value, field_name: &str) -> Option<toml_edit::Item> {
-    use toml_edit::{Array, InlineTable, Item};
+    json_value_to_toml_value(value, field_name).map(toml_edit::Item::Value)
+}
+
+fn json_value_to_toml_value(value: &Value, field_name: &str) -> Option<toml_edit::Value> {
+    use toml_edit::{Array, InlineTable, Value as TomlValue};
 
     match value {
-        Value::String(s) => Some(toml_edit::value(s.as_str())),
-
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(toml_edit::value(i))
-            } else if let Some(f) = n.as_f64() {
-                Some(toml_edit::value(f))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 无法转换的数字类型 {n}");
-                None
+        Value::String(value) => Some(TomlValue::from(value.as_str())),
+        Value::Number(value) => value
+            .as_i64()
+            .map(TomlValue::from)
+            .or_else(|| value.as_f64().map(TomlValue::from)),
+        Value::Bool(value) => Some(TomlValue::from(*value)),
+        Value::Array(values) => {
+            let converted = values
+                .iter()
+                .map(|value| json_value_to_toml_value(value, field_name))
+                .collect::<Option<Vec<_>>>()?;
+            let mut array = Array::default();
+            for value in converted {
+                array.push(value);
             }
+            Some(TomlValue::Array(array))
         }
-
-        Value::Bool(b) => Some(toml_edit::value(*b)),
-
-        Value::Array(arr) => {
-            // 只支持简单类型的数组（字符串、数字、布尔）
-            let mut toml_arr = Array::default();
-            let mut all_same_type = true;
-
-            for item in arr {
-                match item {
-                    Value::String(s) => toml_arr.push(s.as_str()),
-                    Value::Number(n) if n.is_i64() => {
-                        if let Some(i) = n.as_i64() {
-                            toml_arr.push(i);
-                        } else {
-                            all_same_type = false;
-                            break;
-                        }
-                    }
-                    Value::Number(n) if n.is_f64() => {
-                        if let Some(f) = n.as_f64() {
-                            toml_arr.push(f);
-                        } else {
-                            all_same_type = false;
-                            break;
-                        }
-                    }
-                    Value::Bool(b) => toml_arr.push(*b),
-                    _ => {
-                        all_same_type = false;
-                        break;
-                    }
-                }
+        Value::Object(values) => {
+            let mut table = InlineTable::new();
+            for (key, value) in values {
+                table.insert(key, json_value_to_toml_value(value, field_name)?);
             }
-
-            if all_same_type && !toml_arr.is_empty() {
-                Some(Item::Value(toml_edit::Value::Array(toml_arr)))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 不支持的数组类型（混合类型或嵌套结构）");
-                None
-            }
+            Some(TomlValue::InlineTable(table))
         }
-
-        Value::Object(obj) => {
-            // 只支持浅层对象（所有值都是字符串）→ TOML Inline Table
-            let mut inline_table = InlineTable::new();
-            let mut all_strings = true;
-
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    // InlineTable 需要 Value 类型，toml_edit::value() 返回 Item，需要提取内部的 Value
-                    inline_table.insert(k, s.into());
-                } else {
-                    all_strings = false;
-                    break;
-                }
-            }
-
-            if all_strings && !inline_table.is_empty() {
-                Some(Item::Value(toml_edit::Value::InlineTable(inline_table)))
-            } else {
-                log::warn!("跳过字段 '{field_name}': 对象值包含非字符串类型，建议使用子表语法");
-                None
-            }
-        }
-
         Value::Null => {
             log::debug!("跳过字段 '{field_name}': TOML 不支持 null 值");
             None

@@ -2,14 +2,28 @@
 //!
 //! 提供 MCP 服务器的 CRUD 操作。
 
-use crate::app_config::{AppType, McpApps, McpServer};
+use crate::app_config::{McpApps, McpServer};
 use crate::database::{lock_conn, Database};
+use crate::domain::ManagedClientId;
 use crate::error::AppError;
 use indexmap::IndexMap;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{params, types::Type, OptionalExtension, Row};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MCP_SERVER_SELECT: &str =
-    "SELECT id, name, server_config, description, homepage, docs, tags, enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode, enabled_hermes FROM mcp_servers";
+    "SELECT id, name, server_config_json, description, homepage, docs, tags_json, enabled_claude, enabled_codex, enabled_opencode FROM core_mcp_servers";
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn invalid_json_column(index: usize, source: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(source))
+}
 
 fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<(String, McpServer)> {
     let id: String = row.get(0)?;
@@ -21,13 +35,11 @@ fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<(String, McpServer)> {
     let tags_str: String = row.get(6)?;
     let enabled_claude: bool = row.get(7)?;
     let enabled_codex: bool = row.get(8)?;
-    let enabled_gemini: bool = row.get(9)?;
-    let enabled_grokbuild: bool = row.get(10)?;
-    let enabled_opencode: bool = row.get(11)?;
-    let enabled_hermes: bool = row.get(12)?;
+    let enabled_opencode: bool = row.get(9)?;
 
-    let server = serde_json::from_str(&server_config_str).unwrap_or_default();
-    let tags = serde_json::from_str(&tags_str).unwrap_or_default();
+    let server =
+        serde_json::from_str(&server_config_str).map_err(|error| invalid_json_column(2, error))?;
+    let tags = serde_json::from_str(&tags_str).map_err(|error| invalid_json_column(6, error))?;
 
     Ok((
         id.clone(),
@@ -38,10 +50,7 @@ fn row_to_mcp_server(row: &Row<'_>) -> rusqlite::Result<(String, McpServer)> {
             apps: McpApps {
                 claude: enabled_claude,
                 codex: enabled_codex,
-                gemini: enabled_gemini,
-                grokbuild: enabled_grokbuild,
                 opencode: enabled_opencode,
-                hermes: enabled_hermes,
             },
             description,
             homepage,
@@ -79,30 +88,24 @@ impl Database {
     pub fn update_mcp_server_app_enabled(
         &self,
         id: &str,
-        app: &AppType,
+        app: ManagedClientId,
         enabled: bool,
     ) -> Result<Option<McpServer>, AppError> {
         let conn = lock_conn!(self.conn);
         let column = match app {
-            AppType::Claude => Some("enabled_claude"),
-            AppType::Codex => Some("enabled_codex"),
-            AppType::Gemini => Some("enabled_gemini"),
-            AppType::GrokBuild => Some("enabled_grokbuild"),
-            AppType::OpenCode => Some("enabled_opencode"),
-            AppType::Hermes => Some("enabled_hermes"),
-            // These applications intentionally have no MCP flag in the SSOT.
-            AppType::ClaudeDesktop | AppType::OpenClaw => None,
+            ManagedClientId::Claude => "enabled_claude",
+            ManagedClientId::Codex => "enabled_codex",
+            ManagedClientId::Opencode => "enabled_opencode",
         };
 
-        if let Some(column) = column {
-            // `column` comes exclusively from the fixed allow-list above.
-            let sql = format!("UPDATE mcp_servers SET {column} = ?1 WHERE id = ?2");
-            let affected = conn
-                .execute(&sql, params![enabled, id])
-                .map_err(|e| AppError::Database(e.to_string()))?;
-            if affected == 0 {
-                return Ok(None);
-            }
+        // `column` comes exclusively from the fixed allow-list above.
+        let sql =
+            format!("UPDATE core_mcp_servers SET {column} = ?1, updated_at_ms = ?2 WHERE id = ?3");
+        let affected = conn
+            .execute(&sql, params![enabled, current_time_ms(), id])
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        if affected == 0 {
+            return Ok(None);
         }
 
         conn.query_row(
@@ -116,12 +119,27 @@ impl Database {
 
     /// 保存 MCP 服务器
     pub fn save_mcp_server(&self, server: &McpServer) -> Result<(), AppError> {
+        server
+            .validate()
+            .map_err(|error| AppError::McpValidation(error.to_string()))?;
         let conn = lock_conn!(self.conn);
+        let now_ms = current_time_ms();
         conn.execute(
-            "INSERT OR REPLACE INTO mcp_servers (
-                id, name, server_config, description, homepage, docs, tags,
-                enabled_claude, enabled_codex, enabled_gemini, enabled_grokbuild, enabled_opencode, enabled_hermes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO core_mcp_servers (
+                id, name, server_config_json, description, homepage, docs, tags_json,
+                enabled_claude, enabled_codex, enabled_opencode, created_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                server_config_json = excluded.server_config_json,
+                description = excluded.description,
+                homepage = excluded.homepage,
+                docs = excluded.docs,
+                tags_json = excluded.tags_json,
+                enabled_claude = excluded.enabled_claude,
+                enabled_codex = excluded.enabled_codex,
+                enabled_opencode = excluded.enabled_opencode,
+                updated_at_ms = excluded.updated_at_ms",
             params![
                 server.id,
                 server.name,
@@ -135,10 +153,8 @@ impl Database {
                     .map_err(|e| AppError::Database(format!("Failed to serialize tags: {e}")))?,
                 server.apps.claude,
                 server.apps.codex,
-                server.apps.gemini,
-                server.apps.grokbuild,
                 server.apps.opencode,
-                server.apps.hermes,
+                now_ms,
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -148,7 +164,7 @@ impl Database {
     /// 删除 MCP 服务器
     pub fn delete_mcp_server(&self, id: &str) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
-        conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])
+        conn.execute("DELETE FROM core_mcp_servers WHERE id = ?1", params![id])
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
@@ -166,10 +182,7 @@ mod tests {
             id: "shared-server".to_string(),
             name: "Shared Server".to_string(),
             server: json!({ "command": "echo", "args": ["hello"] }),
-            apps: McpApps {
-                gemini: true,
-                ..McpApps::default()
-            },
+            apps: McpApps::default(),
             description: Some("description".to_string()),
             homepage: Some("https://example.com".to_string()),
             docs: None,
@@ -183,19 +196,17 @@ mod tests {
         db.save_mcp_server(&test_server()).expect("seed server");
 
         let after_claude = db
-            .update_mcp_server_app_enabled("shared-server", &AppType::Claude, true)
+            .update_mcp_server_app_enabled("shared-server", ManagedClientId::Claude, true)
             .expect("enable Claude")
             .expect("server exists");
         assert!(after_claude.apps.claude);
-        assert!(after_claude.apps.gemini);
 
         let after_codex = db
-            .update_mcp_server_app_enabled("shared-server", &AppType::Codex, true)
+            .update_mcp_server_app_enabled("shared-server", ManagedClientId::Codex, true)
             .expect("enable Codex")
             .expect("server exists");
         assert!(after_codex.apps.claude);
         assert!(after_codex.apps.codex);
-        assert!(after_codex.apps.gemini);
         assert_eq!(after_codex.description.as_deref(), Some("description"));
         assert_eq!(after_codex.tags, vec!["shared"]);
 
@@ -213,12 +224,12 @@ mod tests {
         db.save_mcp_server(&test_server()).expect("seed server");
         let barrier = Arc::new(Barrier::new(3));
 
-        let handles = [AppType::Claude, AppType::Codex].map(|app| {
+        let handles = [ManagedClientId::Claude, ManagedClientId::Codex].map(|app| {
             let db = Arc::clone(&db);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                db.update_mcp_server_app_enabled("shared-server", &app, true)
+                db.update_mcp_server_app_enabled("shared-server", app, true)
                     .expect("update app flag")
                     .expect("server exists");
             })
@@ -236,7 +247,6 @@ mod tests {
             .expect("stored server");
         assert!(stored.apps.claude);
         assert!(stored.apps.codex);
-        assert!(stored.apps.gemini);
     }
 
     #[test]
@@ -244,7 +254,7 @@ mod tests {
         let db = Database::memory().expect("create memory db");
 
         let updated = db
-            .update_mcp_server_app_enabled("missing", &AppType::Claude, true)
+            .update_mcp_server_app_enabled("missing", ManagedClientId::Claude, true)
             .expect("update missing server");
 
         assert!(updated.is_none());
@@ -252,17 +262,30 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_mcp_apps_keep_the_existing_noop_semantics() {
+    fn production_mcp_crud_uses_only_the_three_client_core_table() -> Result<(), AppError> {
         let db = Database::memory().expect("create memory db");
-        let original = test_server();
-        db.save_mcp_server(&original).expect("seed server");
+        assert!(db
+            .get_all_mcp_servers()
+            .expect("read core servers")
+            .is_empty());
+        db.save_mcp_server(&test_server())
+            .expect("save core server");
 
-        for app in [AppType::ClaudeDesktop, AppType::OpenClaw] {
-            let returned = db
-                .update_mcp_server_app_enabled("shared-server", &app, true)
-                .expect("toggle unsupported app")
-                .expect("server exists");
-            assert_eq!(returned.apps, original.apps);
-        }
+        let conn = lock_conn!(db.conn);
+        let core_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM core_mcp_servers", [], |row| {
+                row.get(0)
+            })
+            .expect("count core servers");
+        let legacy_table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mcp_servers'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check legacy table absence");
+        assert_eq!(core_count, 1);
+        assert_eq!(legacy_table_count, 0);
+        Ok(())
     }
 }

@@ -1,0 +1,8 @@
+{
+  "id": "fixture-opencode-message",
+  "sessionID": "fixture-opencode-session",
+  "role": "user",
+  "time": {
+    "created": "2026-01-01T01:20:01Z"
+  }
+}

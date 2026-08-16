@@ -1,755 +1,495 @@
 import { createRef } from "react";
-import { render, screen, waitFor, act, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import UnifiedSkillsPanel, {
   type UnifiedSkillsPanelHandle,
 } from "@/components/skills/UnifiedSkillsPanel";
-import type {
-  InstalledSkill,
-  SkillBackupEntry,
-  SkillUpdateInfo,
-} from "@/lib/api/skills";
+import type { InstalledSkill, UnmanagedSkill } from "@/lib/api/skills";
 
-const scanUnmanagedMock = vi.fn();
-const toggleSkillAppMock = vi.fn();
-const uninstallSkillMock = vi.fn();
-const importSkillsMock = vi.fn();
-const installFromZipMock = vi.fn();
-const deleteSkillBackupMock = vi.fn();
-const restoreSkillBackupMock = vi.fn();
-const bulkToggleSkillAppMock = vi.fn();
-const checkUpdatesMock = vi.fn();
-const updateSkillMock = vi.fn();
-const refetchSkillBackupsMock = vi.fn();
-const { toastErrorMock, toastSuccessMock } = vi.hoisted(() => ({
-  toastErrorMock: vi.fn(),
-  toastSuccessMock: vi.fn(),
+const mocks = vi.hoisted(() => ({
+  useScanUnmanagedSkills: vi.fn(),
+  scanUnmanaged: vi.fn(),
+  toggleApp: vi.fn(),
+  bulkToggleApp: vi.fn(),
+  syncFromLive: vi.fn(),
+  uninstall: vi.fn(),
+  importFromApps: vi.fn(),
+  toastError: vi.fn(),
+  toastSuccess: vi.fn(),
 }));
-let installedSkillsMock: InstalledSkill[] = [];
-let skillBackupsMock: SkillBackupEntry[] = [];
-let skillUpdatesMock: SkillUpdateInfo[] = [];
-let checkUpdatesFetching = false;
-let toggleSkillAppPending = false;
-let toggleSkillAppVariables:
-  | { id: string; app: "claude"; enabled: boolean }
-  | undefined;
-let bulkToggleSkillAppPending = false;
-let bulkToggleSkillAppVariables:
-  | { ids: string[]; app: "claude"; enabled: boolean }
-  | undefined;
+
+let installedSkills: InstalledSkill[] = [];
+let unmanagedSkills: UnmanagedSkill[] = [];
 
 vi.mock("sonner", () => ({
   toast: {
-    success: toastSuccessMock,
-    error: toastErrorMock,
-    info: vi.fn(),
+    error: mocks.toastError,
+    success: mocks.toastSuccess,
   },
 }));
 
 vi.mock("@/hooks/useSkills", () => ({
-  useInstalledSkills: () => ({
-    data: installedSkillsMock,
-    isLoading: false,
-  }),
-  useSkillBackups: () => ({
-    data: skillBackupsMock,
-    refetch: refetchSkillBackupsMock,
-    isFetching: false,
-  }),
-  useDeleteSkillBackup: () => ({
-    mutateAsync: deleteSkillBackupMock,
-    isPending: false,
-  }),
+  useInstalledSkills: () => ({ data: installedSkills, isLoading: false }),
   useToggleSkillApp: () => ({
-    mutateAsync: toggleSkillAppMock,
-    isPending: toggleSkillAppPending,
-    variables: toggleSkillAppVariables,
+    mutateAsync: mocks.toggleApp,
+    isPending: false,
+    variables: undefined,
   }),
   useBulkToggleSkillApp: () => ({
-    mutateAsync: bulkToggleSkillAppMock,
-    isPending: bulkToggleSkillAppPending,
-    variables: bulkToggleSkillAppVariables,
-  }),
-  useRestoreSkillBackup: () => ({
-    mutateAsync: restoreSkillBackupMock,
+    mutateAsync: mocks.bulkToggleApp,
     isPending: false,
+    variables: undefined,
+  }),
+  useSyncSkillFromLive: () => ({
+    mutateAsync: mocks.syncFromLive,
+    isPending: false,
+    variables: undefined,
   }),
   useUninstallSkill: () => ({
-    mutateAsync: uninstallSkillMock,
-  }),
-  useScanUnmanagedSkills: () => ({
-    data: [
-      {
-        directory: "shared-skill",
-        name: "Shared Skill",
-        description: "Imported from Grok Build",
-        foundIn: ["grokbuild"],
-        path: "/tmp/shared-skill",
-      },
-    ],
-    refetch: scanUnmanagedMock,
-  }),
-  useImportSkillsFromApps: () => ({
-    mutateAsync: importSkillsMock,
-  }),
-  useInstallSkillsFromZip: () => ({
-    mutateAsync: installFromZipMock,
-  }),
-  useCheckSkillUpdates: () => ({
-    data: skillUpdatesMock,
-    refetch: checkUpdatesMock,
-    isFetching: checkUpdatesFetching,
-  }),
-  useUpdateSkill: () => ({
-    mutateAsync: updateSkillMock,
+    mutateAsync: mocks.uninstall,
     isPending: false,
   }),
+  useImportSkillsFromApps: () => ({
+    mutateAsync: mocks.importFromApps,
+    isPending: false,
+  }),
+  useScanUnmanagedSkills: mocks.useScanUnmanagedSkills,
 }));
 
-type InstalledSkillOverrides = Omit<Partial<InstalledSkill>, "apps"> & {
+type SkillOverrides = Omit<Partial<InstalledSkill>, "apps"> & {
   apps?: Partial<InstalledSkill["apps"]>;
 };
 
-const makeInstalledSkill = (
-  overrides: InstalledSkillOverrides = {},
-): InstalledSkill => {
-  const defaultApps: InstalledSkill["apps"] = {
-    claude: false,
-    codex: false,
-    gemini: false,
-    grokbuild: false,
-    opencode: false,
-    openclaw: false,
-    hermes: false,
-  };
-  const { apps, ...skillOverrides } = overrides;
-
+function makeSkill(overrides: SkillOverrides = {}): InstalledSkill {
+  const { apps, ...rest } = overrides;
   return {
-    id: "owner/repo:alpha-skill",
+    id: "alpha-id",
     name: "Alpha Skill",
     description: "Alpha description",
-    directory: "alpha-skill",
-    repoOwner: "owner",
-    repoName: "repo",
-    repoBranch: "main",
-    apps: { ...defaultApps, ...apps },
-    installedAt: 1,
-    updatedAt: 1,
-    ...skillOverrides,
+    directory: "alpha-directory",
+    contentHash: "alpha-hash",
+    totalSizeBytes: 1024,
+    fileCount: 2,
+    apps: {
+      claude: false,
+      codex: true,
+      opencode: false,
+      ...apps,
+    },
+    cloudEligible: true,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    ...rest,
   };
-};
+}
 
-const renderPanel = () =>
-  render(<UnifiedSkillsPanel onOpenDiscovery={() => {}} currentApp="claude" />);
+function renderPanel(
+  props: Partial<React.ComponentProps<typeof UnifiedSkillsPanel>> = {},
+) {
+  return render(<UnifiedSkillsPanel currentApp="claude" {...props} />);
+}
 
-describe("UnifiedSkillsPanel", () => {
+describe("UnifiedSkillsPanel local-only management", () => {
   beforeEach(() => {
-    installedSkillsMock = [];
-    skillBackupsMock = [];
-    skillUpdatesMock = [];
-    checkUpdatesFetching = false;
-    toggleSkillAppPending = false;
-    toggleSkillAppVariables = undefined;
-    bulkToggleSkillAppPending = false;
-    bulkToggleSkillAppVariables = undefined;
-    scanUnmanagedMock.mockReset();
-    scanUnmanagedMock.mockResolvedValue({
-      data: [
-        {
-          directory: "shared-skill",
-          name: "Shared Skill",
-          description: "Imported from Grok Build",
-          foundIn: ["grokbuild"],
-          path: "/tmp/shared-skill",
-        },
-      ],
-    });
-    toggleSkillAppMock.mockReset();
-    toggleSkillAppMock.mockResolvedValue(true);
-    bulkToggleSkillAppMock.mockReset();
-    bulkToggleSkillAppMock.mockResolvedValue({ succeeded: [], failed: [] });
-    toastErrorMock.mockReset();
-    toastSuccessMock.mockReset();
-    uninstallSkillMock.mockReset();
-    importSkillsMock.mockReset();
-    installFromZipMock.mockReset();
-    deleteSkillBackupMock.mockReset();
-    refetchSkillBackupsMock.mockReset();
-    refetchSkillBackupsMock.mockResolvedValue({ data: skillBackupsMock });
-    restoreSkillBackupMock.mockReset();
-    checkUpdatesMock.mockReset();
-    checkUpdatesMock.mockResolvedValue({ data: [] });
-    updateSkillMock.mockReset();
-    updateSkillMock.mockImplementation(async (id: string) =>
-      makeInstalledSkill({ id }),
-    );
+    installedSkills = [];
+    unmanagedSkills = [
+      {
+        directory: "shared-skill",
+        name: "Shared Skill",
+        description: "Found in OpenCode",
+        foundIn: ["opencode"],
+        path: "/home/zhldm/.config/opencode/skills/shared-skill",
+      },
+    ];
+    for (const mock of Object.values(mocks)) mock.mockReset();
+    mocks.useScanUnmanagedSkills.mockImplementation(() => ({
+      data: unmanagedSkills,
+      refetch: mocks.scanUnmanaged,
+    }));
+    mocks.scanUnmanaged.mockResolvedValue({ data: unmanagedSkills });
+    mocks.toggleApp.mockResolvedValue(makeSkill());
+    mocks.bulkToggleApp.mockResolvedValue({ succeeded: [], failed: [] });
+    mocks.syncFromLive.mockResolvedValue(makeSkill());
+    mocks.uninstall.mockResolvedValue(true);
+    mocks.importFromApps.mockResolvedValue([makeSkill()]);
   });
 
-  it("opens the import dialog without crashing when app toggles render", async () => {
-    const ref = createRef<UnifiedSkillsPanelHandle>();
+  it("shows a local import empty state instead of repository discovery", () => {
+    renderPanel();
 
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
+    expect(screen.getByText("skills.noInstalled")).toBeInTheDocument();
+    expect(
+      screen.getByText("skills.noInstalledDescription"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("skills.discover")).not.toBeInTheDocument();
+    expect(screen.queryByText("skills.checkUpdates")).not.toBeInTheDocument();
+  });
+
+  it("offers local import without scanning automatically on page mount", async () => {
+    renderPanel();
+
+    expect(mocks.useScanUnmanagedSkills).toHaveBeenCalledWith({
+      enabled: false,
+    });
+    expect(mocks.scanUnmanaged).not.toHaveBeenCalled();
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "skills.import" }));
+
+    expect(mocks.scanUnmanaged).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("opens the import dialog with progress while the WSL scan is running", async () => {
+    let finishScan: ((value: { data: UnmanagedSkill[] }) => void) | undefined;
+    mocks.scanUnmanaged.mockImplementationOnce(
+      () =>
+        new Promise<{ data: UnmanagedSkill[] }>((resolve) => {
+          finishScan = resolve;
+        }),
+    );
+    renderPanel();
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "skills.import" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("skills.scanLoading")).toBeInTheDocument();
+
+    await act(async () => finishScan?.({ data: unmanagedSkills }));
+    expect(within(dialog).getByText("Shared Skill")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["name", "Alpha Skill"],
+    ["id", "alpha-id"],
+    ["description", "Alpha description"],
+    ["directory", "alpha-directory"],
+  ])("filters local Skills by %s", async (_field, query) => {
+    installedSkills = [
+      makeSkill(),
+      makeSkill({
+        id: "beta",
+        name: "Beta",
+        description: "Beta description",
+        directory: "beta-directory",
+      }),
+    ];
+    renderPanel();
+
+    await userEvent.setup().type(
+      screen.getByRole("textbox", {
+        name: "skills.installedSearchAriaLabel",
+      }),
+      query,
     );
 
-    await act(async () => {
-      await ref.current?.openImport();
-    });
+    expect(screen.getByText("Alpha Skill")).toBeInTheDocument();
+    expect(screen.queryByText("Beta")).not.toBeInTheDocument();
+  });
+
+  it("bulk toggles the full list using an existing live source", async () => {
+    installedSkills = [
+      makeSkill({ id: "alpha", apps: { codex: true } }),
+      makeSkill({
+        id: "beta",
+        name: "Beta",
+        apps: { codex: false, opencode: true },
+      }),
+    ];
+    renderPanel();
+
+    await userEvent
+      .setup()
+      .click(screen.getByText("Claude:").closest("button")!);
 
     await waitFor(() => {
-      expect(screen.getByText("skills.import")).toBeInTheDocument();
-      expect(screen.getByText("Shared Skill")).toBeInTheDocument();
-      expect(screen.getByText("/tmp/shared-skill")).toBeInTheDocument();
+      expect(mocks.bulkToggleApp).toHaveBeenCalledWith({
+        ids: ["alpha", "beta"],
+        app: "claude",
+        sourceApps: { alpha: "codex", beta: "opencode" },
+        enabled: true,
+      });
     });
+  });
 
-    await act(async () => {
-      screen.getByText("skills.importSelected").click();
-    });
+  it("toggles one client from the first enabled local source", async () => {
+    installedSkills = [makeSkill({ apps: { codex: true } })];
+    renderPanel();
+
+    const row = screen.getByText("Alpha Skill").closest<HTMLElement>(".group")!;
+    await userEvent
+      .setup()
+      .click(within(row).getByRole("button", { name: "OpenCode" }));
 
     await waitFor(() => {
-      expect(importSkillsMock).toHaveBeenCalledWith([
+      expect(mocks.toggleApp).toHaveBeenCalledWith({
+        id: "alpha-id",
+        app: "opencode",
+        sourceApp: "codex",
+        enabled: true,
+      });
+    });
+  });
+
+  it("offers explicit live sync only for the current enabled client", async () => {
+    installedSkills = [makeSkill({ apps: { claude: true, codex: true } })];
+    renderPanel();
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "skills.syncFromLive" }));
+
+    await waitFor(() => {
+      expect(mocks.syncFromLive).toHaveBeenCalledWith({
+        id: "alpha-id",
+        sourceApp: "claude",
+      });
+    });
+  });
+
+  it("imports scanned local content with an explicit source and target apps", async () => {
+    const ref = createRef<UnifiedSkillsPanelHandle>();
+    render(<UnifiedSkillsPanel ref={ref} currentApp="claude" />);
+
+    await act(async () => {
+      ref.current?.openImport();
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("Shared Skill")).toBeInTheDocument();
+    await userEvent
+      .setup()
+      .click(
+        within(dialog).getByRole("button", { name: "skills.importSelected" }),
+      );
+
+    await waitFor(() => {
+      expect(mocks.importFromApps).toHaveBeenCalledWith([
         {
           directory: "shared-skill",
-          apps: expect.objectContaining({ grokbuild: true }),
+          sourceClient: "opencode",
+          apps: { claude: false, codex: false, opencode: true },
         },
       ]);
     });
   });
 
-  it("passes only the installed Skill ID to uninstall", async () => {
-    installedSkillsMock = [
-      makeInstalledSkill({
-        id: "owner/repo:skill-id",
-        directory: "nested/skill-directory",
-        repoOwner: "owner",
-        repoName: "repo",
-      }),
+  it("defaults a multi-client Skill to only its explicit content source", async () => {
+    unmanagedSkills = [
+      {
+        directory: "shared-skill",
+        name: "Shared Skill",
+        description: "Different copies may exist",
+        foundIn: ["claude", "codex"],
+        path: "/home/zhldm/.claude/skills/shared-skill",
+      },
     ];
-    uninstallSkillMock.mockResolvedValueOnce({ backupPath: undefined });
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.click(screen.getByTitle("skills.uninstall"));
-    await user.click(
-      screen.getByRole("button", {
-        name: "common.confirm",
-      }),
-    );
-
-    await waitFor(() => {
-      expect(uninstallSkillMock).toHaveBeenCalledWith("owner/repo:skill-id");
-    });
-  });
-
-  it.each([
-    ["name", "searchable name"],
-    ["id", "opaque-id-token"],
-    ["description", "descriptive-token"],
-    ["directory", "directory-token"],
-    ["repo owner", "owner-token"],
-    ["repo name", "repository-token"],
-  ])("filters installed Skills by %s", async (_field, query) => {
-    installedSkillsMock = [
-      makeInstalledSkill({
-        id: "opaque-id-token",
-        name: "Searchable Name",
-        description: "Contains descriptive-token",
-        directory: "nested/directory-token",
-        repoOwner: "owner-token",
-        repoName: "repository-token",
-      }),
-      makeInstalledSkill({
-        id: "unrelated-id",
-        name: "Unrelated Skill",
-        description: "Nothing to match",
-        directory: "other-directory",
-        repoOwner: "another-owner",
-        repoName: "another-repo",
-      }),
-    ];
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.type(
-      screen.getByRole("textbox", {
-        name: "skills.installedSearchAriaLabel",
-      }),
-      `  ${query.toUpperCase()}  `,
-    );
-
-    expect(screen.getByText("Searchable Name")).toBeInTheDocument();
-    expect(screen.queryByText("Unrelated Skill")).not.toBeInTheDocument();
-  });
-
-  it("distinguishes an empty list from an installed-Skill search miss", async () => {
-    const { rerender } = renderPanel();
-
-    expect(screen.getByText("skills.noInstalled")).toBeInTheDocument();
-    expect(
-      screen.queryByText("skills.noInstalledSearchResults"),
-    ).not.toBeInTheDocument();
-
-    installedSkillsMock = [makeInstalledSkill()];
-    rerender(
-      <UnifiedSkillsPanel onOpenDiscovery={() => {}} currentApp="claude" />,
-    );
-    const user = userEvent.setup();
-    await user.type(
-      screen.getByRole("textbox", {
-        name: "skills.installedSearchAriaLabel",
-      }),
-      "missing",
-    );
-
-    expect(
-      screen.getByText("skills.noInstalledSearchResults"),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("skills.noInstalled")).not.toBeInTheDocument();
-  });
-
-  it("keeps the search control outside the visible scroll viewport", () => {
-    installedSkillsMock = [makeInstalledSkill()];
-    const { container } = renderPanel();
-
-    const searchInput = screen.getByRole("textbox", {
-      name: "skills.installedSearchAriaLabel",
-    });
-    const viewport = container.querySelector(
-      "[data-radix-scroll-area-viewport]",
-    );
-
-    expect(viewport).not.toBeNull();
-    expect(viewport).not.toContainElement(searchInput);
-  });
-
-  it("enables only disabled Skills from the full list when the app state is mixed", async () => {
-    installedSkillsMock = [
-      makeInstalledSkill({
-        id: "enabled-id",
-        name: "Visible Skill",
-        apps: { claude: true },
-      }),
-      makeInstalledSkill({ id: "disabled-id-1", name: "Hidden Skill One" }),
-      makeInstalledSkill({ id: "disabled-id-2", name: "Hidden Skill Two" }),
-    ];
-    bulkToggleSkillAppMock.mockResolvedValue({
-      succeeded: ["disabled-id-1", "disabled-id-2"],
-      failed: [],
-    });
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.type(
-      screen.getByRole("textbox", {
-        name: "skills.installedSearchAriaLabel",
-      }),
-      "Visible Skill",
-    );
-    await user.click(screen.getByText("Claude:").closest("button")!);
-
-    await waitFor(() => {
-      expect(bulkToggleSkillAppMock).toHaveBeenCalledWith({
-        ids: ["disabled-id-1", "disabled-id-2"],
-        app: "claude",
-        enabled: true,
-      });
-    });
-  });
-
-  it("enables all Skills when none are enabled for an app", async () => {
-    installedSkillsMock = [
-      makeInstalledSkill({ id: "first-id" }),
-      makeInstalledSkill({ id: "second-id" }),
-    ];
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Claude:").closest("button")!);
-
-    await waitFor(() => {
-      expect(bulkToggleSkillAppMock).toHaveBeenCalledWith({
-        ids: ["first-id", "second-id"],
-        app: "claude",
-        enabled: true,
-      });
-    });
-  });
-
-  it("disables all Skills when every Skill is enabled for an app", async () => {
-    installedSkillsMock = [
-      makeInstalledSkill({ id: "first-id", apps: { claude: true } }),
-      makeInstalledSkill({ id: "second-id", apps: { claude: true } }),
-    ];
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Claude:").closest("button")!);
-
-    await waitFor(() => {
-      expect(bulkToggleSkillAppMock).toHaveBeenCalledWith({
-        ids: ["first-id", "second-id"],
-        app: "claude",
-        enabled: false,
-      });
-    });
-  });
-
-  it("reports partial bulk-toggle failures", async () => {
-    installedSkillsMock = [
-      makeInstalledSkill({ id: "first-id" }),
-      makeInstalledSkill({ id: "second-id" }),
-    ];
-    bulkToggleSkillAppMock.mockResolvedValue({
-      succeeded: ["first-id"],
-      failed: [{ item: "second-id", error: new Error("permission denied") }],
-    });
-    renderPanel();
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Claude:").closest("button")!);
-
-    await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("common.bulkToggleFailed", {
-        description: "Error: permission denied",
-      });
-    });
-  });
-
-  it.each(["single", "bulk"] as const)(
-    "disables row app toggles while a %s toggle is pending",
-    async (pendingKind) => {
-      installedSkillsMock = [makeInstalledSkill()];
-      if (pendingKind === "single") {
-        toggleSkillAppPending = true;
-        toggleSkillAppVariables = {
-          id: "owner/repo:alpha-skill",
-          app: "claude",
-          enabled: true,
-        };
-      } else {
-        bulkToggleSkillAppPending = true;
-        bulkToggleSkillAppVariables = {
-          ids: ["owner/repo:alpha-skill"],
-          app: "claude",
-          enabled: true,
-        };
-      }
-      renderPanel();
-
-      const row = screen.getByText("Alpha Skill").closest(".group");
-      const appToggleButtons = Array.from(
-        row!.querySelectorAll<HTMLButtonElement>("button"),
-      ).slice(0, 6);
-
-      expect(appToggleButtons).toHaveLength(6);
-      appToggleButtons.forEach((button) => expect(button).toBeDisabled());
-      expect(screen.getByTitle("skills.uninstall")).toBeDisabled();
-      await userEvent.setup().click(appToggleButtons[0]);
-      expect(toggleSkillAppMock).not.toHaveBeenCalled();
-    },
-  );
-
-  it("reports check-update availability and clears it on unmount", async () => {
-    installedSkillsMock = [makeInstalledSkill()];
-    const onCheckUpdatesStateChange = vi.fn();
-
-    const { unmount } = render(
-      <UnifiedSkillsPanel
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-        onCheckUpdatesStateChange={onCheckUpdatesStateChange}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(onCheckUpdatesStateChange).toHaveBeenLastCalledWith({
-        isChecking: false,
-        hasSkills: true,
-      });
-    });
-    expect(screen.queryByText("skills.checkUpdates")).not.toBeInTheDocument();
-
-    unmount();
-    expect(onCheckUpdatesStateChange).toHaveBeenLastCalledWith({
-      isChecking: false,
-      hasSkills: false,
-    });
-  });
-
-  it("ignores rapid duplicate check-update ref calls", async () => {
-    installedSkillsMock = [makeInstalledSkill()];
-    let resolveCheck!: (value: { data: never[] }) => void;
-    checkUpdatesMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveCheck = resolve;
-      }),
-    );
     const ref = createRef<UnifiedSkillsPanelHandle>();
-
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
-    );
-
-    act(() => {
-      ref.current?.checkUpdates();
-      ref.current?.checkUpdates();
-    });
-    expect(checkUpdatesMock).toHaveBeenCalledTimes(1);
+    render(<UnifiedSkillsPanel ref={ref} currentApp="claude" />);
 
     await act(async () => {
-      resolveCheck({ data: [] });
-      await Promise.resolve();
+      ref.current?.openImport();
     });
-  });
-
-  it("blocks actions but not navigation while checking updates", async () => {
-    installedSkillsMock = [makeInstalledSkill()];
-    checkUpdatesFetching = true;
-    const ref = createRef<UnifiedSkillsPanelHandle>();
-    const onInteractionBlockedChange = vi.fn();
-    const onNavigationBlockedChange = vi.fn();
-
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-        onInteractionBlockedChange={onInteractionBlockedChange}
-        onNavigationBlockedChange={onNavigationBlockedChange}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(onInteractionBlockedChange).toHaveBeenLastCalledWith(true);
-      expect(onNavigationBlockedChange).toHaveBeenLastCalledWith(false);
-    });
-    expect(screen.getByText("Claude:").closest("button")).toBeDisabled();
-    expect(screen.getByTitle("skills.uninstall")).toBeDisabled();
-
-    await act(async () => {
-      await ref.current?.openImport();
-    });
-    expect(scanUnmanagedMock).not.toHaveBeenCalled();
-  });
-
-  it("closes the backup dialog and reports an explicit refresh failure", async () => {
-    refetchSkillBackupsMock.mockRejectedValueOnce(new Error("refresh failed"));
-    const ref = createRef<UnifiedSkillsPanelHandle>();
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
-    );
-
-    await act(async () => {
-      await ref.current?.openRestoreFromBackup();
-    });
-
-    expect(refetchSkillBackupsMock).toHaveBeenCalledWith({
-      throwOnError: true,
-    });
-    expect(toastErrorMock).toHaveBeenCalledWith("common.error", {
-      description: "Error: refresh failed",
-    });
-    expect(
-      screen.queryByText("skills.restoreFromBackup.title"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("blocks writes immediately when an update check starts", async () => {
-    installedSkillsMock = [makeInstalledSkill()];
-    let resolveCheck!: (value: { data: never[] }) => void;
-    checkUpdatesMock.mockReturnValue(
-      new Promise((resolve) => {
-        resolveCheck = resolve;
-      }),
-    );
-    const ref = createRef<UnifiedSkillsPanelHandle>();
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
-    );
-
-    act(() => {
-      ref.current?.checkUpdates();
-    });
-    expect(checkUpdatesMock).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      await ref.current?.openImport();
-    });
-    await userEvent.setup().click(screen.getByTitle("skills.uninstall"));
+    const dialog = await screen.findByRole("dialog");
     await userEvent
       .setup()
-      .click(screen.getByText("Claude:").closest("button")!);
+      .click(
+        within(dialog).getByRole("button", { name: "skills.importSelected" }),
+      );
 
-    expect(scanUnmanagedMock).not.toHaveBeenCalled();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(bulkToggleSkillAppMock).not.toHaveBeenCalled();
-
-    await act(async () => {
-      resolveCheck({ data: [] });
-      await Promise.resolve();
+    await waitFor(() => {
+      expect(mocks.importFromApps).toHaveBeenCalledWith([
+        {
+          directory: "shared-skill",
+          sourceClient: "claude",
+          apps: { claude: true, codex: false, opencode: false },
+        },
+      ]);
     });
   });
 
-  it("ignores stale update entries for uninstalled Skills", async () => {
-    installedSkillsMock = [makeInstalledSkill({ id: "installed-id" })];
-    skillUpdatesMock = [
-      { id: "removed-id", name: "Removed Skill", remoteHash: "removed" },
-      { id: "installed-id", name: "Alpha Skill", remoteHash: "current" },
+  it("preselects hash-identical copies and leaves divergent ones off", async () => {
+    unmanagedSkills = [
+      {
+        directory: "shared-skill",
+        name: "Shared Skill",
+        foundIn: ["claude", "codex", "opencode"],
+        copies: [
+          { client: "claude", contentHash: "hash-a" },
+          { client: "codex", contentHash: "hash-a" },
+          { client: "opencode", contentHash: "hash-b" },
+        ],
+        path: "/home/zhldm/.claude/skills/shared-skill",
+      },
+    ];
+    const ref = createRef<UnifiedSkillsPanelHandle>();
+    render(<UnifiedSkillsPanel ref={ref} currentApp="claude" />);
+
+    await act(async () => {
+      ref.current?.openImport();
+    });
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText("skills.importCopiesConflict"),
+    ).toBeInTheDocument();
+
+    await userEvent
+      .setup()
+      .click(
+        within(dialog).getByRole("button", { name: "skills.importSelected" }),
+      );
+
+    await waitFor(() => {
+      expect(mocks.importFromApps).toHaveBeenCalledWith([
+        {
+          directory: "shared-skill",
+          sourceClient: "claude",
+          apps: { claude: true, codex: true, opencode: false },
+        },
+      ]);
+    });
+  });
+
+  it("marks fully identical copies and enables every found client", async () => {
+    unmanagedSkills = [
+      {
+        directory: "shared-skill",
+        name: "Shared Skill",
+        foundIn: ["claude", "codex"],
+        copies: [
+          { client: "claude", contentHash: "hash-a" },
+          { client: "codex", contentHash: "hash-a" },
+        ],
+        path: "/home/zhldm/.claude/skills/shared-skill",
+      },
+    ];
+    const ref = createRef<UnifiedSkillsPanelHandle>();
+    render(<UnifiedSkillsPanel ref={ref} currentApp="claude" />);
+
+    await act(async () => {
+      ref.current?.openImport();
+    });
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText("skills.importCopiesConsistent"),
+    ).toBeInTheDocument();
+
+    await userEvent
+      .setup()
+      .click(
+        within(dialog).getByRole("button", { name: "skills.importSelected" }),
+      );
+
+    await waitFor(() => {
+      expect(mocks.importFromApps).toHaveBeenCalledWith([
+        {
+          directory: "shared-skill",
+          sourceClient: "claude",
+          apps: { claude: true, codex: true, opencode: false },
+        },
+      ]);
+    });
+  });
+
+  it("resets import targets when the explicit content source changes", async () => {
+    unmanagedSkills = [
+      {
+        directory: "shared-skill",
+        name: "Shared Skill",
+        foundIn: ["claude", "codex"],
+        path: "/home/zhldm/.claude/skills/shared-skill",
+      },
+    ];
+    const ref = createRef<UnifiedSkillsPanelHandle>();
+    render(<UnifiedSkillsPanel ref={ref} currentApp="claude" />);
+
+    await act(async () => {
+      ref.current?.openImport();
+    });
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.setup().selectOptions(
+      within(dialog).getByRole("combobox", {
+        name: "skills.sourceClient: Shared Skill",
+      }),
+      "codex",
+    );
+    await userEvent
+      .setup()
+      .click(
+        within(dialog).getByRole("button", { name: "skills.importSelected" }),
+      );
+
+    await waitFor(() => {
+      expect(mocks.importFromApps).toHaveBeenCalledWith([
+        {
+          directory: "shared-skill",
+          sourceClient: "codex",
+          apps: { claude: false, codex: true, opencode: false },
+        },
+      ]);
+    });
+  });
+
+  it("deletes from all enabled clients without exposing a backup result", async () => {
+    installedSkills = [makeSkill()];
+    renderPanel();
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "skills.uninstall" }));
+    const dialog = screen.getByRole("dialog");
+    await userEvent
+      .setup()
+      .click(within(dialog).getByRole("button", { name: "skills.uninstall" }));
+
+    await waitFor(() =>
+      expect(mocks.uninstall).toHaveBeenCalledWith("alpha-id"),
+    );
+    expect(mocks.toastSuccess).toHaveBeenCalledWith("skills.uninstallSuccess", {
+      closeButton: true,
+    });
+  });
+
+  it("marks oversized local Skills as unavailable for cloud sync", () => {
+    installedSkills = [makeSkill({ cloudEligible: false })];
+    renderPanel();
+
+    expect(screen.getByText("skills.localOnly")).toBeInTheDocument();
+    expect(
+      screen.getByTitle("skills.localOnlyDescription"),
+    ).toBeInTheDocument();
+  });
+
+  it("opens a read-only detail dialog with per-client status and paths", async () => {
+    installedSkills = [
+      makeSkill({
+        apps: { claude: false, codex: true, opencode: false },
+      }),
     ];
     renderPanel();
 
-    expect(screen.getAllByText("skills.updateAvailable")).toHaveLength(1);
-    await userEvent.setup().click(
-      screen.getByRole("button", {
-        name: "skills.updateAll",
-      }),
-    );
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Alpha Skill" }));
 
-    await waitFor(() => {
-      expect(updateSkillMock).toHaveBeenCalledTimes(1);
-      expect(updateSkillMock).toHaveBeenCalledWith("installed-id");
-    });
-  });
-
-  it("waits for an explicit backup refresh before reporting deletion failure", async () => {
-    skillBackupsMock = [
-      {
-        backupId: "backup-1",
-        backupPath: "C:\\backups\\backup-1",
-        createdAt: 1,
-        skill: makeInstalledSkill({ name: "Backup Skill" }),
-      },
-    ];
-    deleteSkillBackupMock.mockRejectedValueOnce(undefined);
-    let releaseRefresh: (() => void) | undefined;
-    const refreshPending = new Promise((resolve) => {
-      releaseRefresh = () => resolve({ data: [] });
-    });
-    refetchSkillBackupsMock
-      .mockResolvedValueOnce({ data: skillBackupsMock })
-      .mockReturnValueOnce(refreshPending);
-    const ref = createRef<UnifiedSkillsPanelHandle>();
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
-    );
-
-    await act(async () => {
-      await ref.current?.openRestoreFromBackup();
-    });
-    const user = userEvent.setup();
-    await user.click(
-      screen.getByRole("button", {
-        name: "skills.restoreFromBackup.delete",
-      }),
-    );
-    const confirmDialog = screen
-      .getByText("skills.restoreFromBackup.deleteConfirmTitle")
-      .closest<HTMLElement>('[role="dialog"]');
-    expect(confirmDialog).not.toBeNull();
-    await user.click(
-      within(confirmDialog!).getByRole("button", {
-        name: "skills.restoreFromBackup.delete",
-      }),
-    );
-
-    await waitFor(() => {
-      expect(deleteSkillBackupMock).toHaveBeenCalledWith("backup-1");
-      expect(refetchSkillBackupsMock).toHaveBeenCalledTimes(2);
-    });
-    expect(toastErrorMock).not.toHaveBeenCalled();
-
-    releaseRefresh?.();
-    await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledTimes(1);
-      expect(toastErrorMock).toHaveBeenCalledWith(
-        "skills.restoreFromBackup.deleteFailed",
-        { description: "undefined" },
-      );
-    });
-    expect(toastSuccessMock).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Alpha Skill")).toBeInTheDocument();
+    expect(within(dialog).getByText("skills.detailPreviewTitle")).toBeInTheDocument();
     expect(
-      screen.queryByText("skills.restoreFromBackup.deleteConfirmTitle"),
-    ).not.toBeInTheDocument();
-  });
-
-  it("does not report a completed deletion as failed when refresh rejects", async () => {
-    const consoleErrorSpy = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
-    skillBackupsMock = [
-      {
-        backupId: "backup-1",
-        backupPath: "C:\\backups\\backup-1",
-        createdAt: 1,
-        skill: makeInstalledSkill({ name: "Backup Skill" }),
-      },
-    ];
-    deleteSkillBackupMock.mockResolvedValueOnce(true);
-    refetchSkillBackupsMock
-      .mockResolvedValueOnce({ data: skillBackupsMock })
-      .mockRejectedValueOnce(new Error("refresh failed"));
-    const ref = createRef<UnifiedSkillsPanelHandle>();
-    render(
-      <UnifiedSkillsPanel
-        ref={ref}
-        onOpenDiscovery={() => {}}
-        currentApp="claude"
-      />,
-    );
-
-    await act(async () => {
-      await ref.current?.openRestoreFromBackup();
-    });
-    const user = userEvent.setup();
-    await user.click(
-      screen.getByRole("button", {
-        name: "skills.restoreFromBackup.delete",
-      }),
-    );
-    const confirmDialog = screen
-      .getByText("skills.restoreFromBackup.deleteConfirmTitle")
-      .closest<HTMLElement>('[role="dialog"]');
-    expect(confirmDialog).not.toBeNull();
-    await user.click(
-      within(confirmDialog!).getByRole("button", {
-        name: "skills.restoreFromBackup.delete",
-      }),
-    );
-
-    await waitFor(() => {
-      expect(toastSuccessMock).toHaveBeenCalledWith(
-        "skills.restoreFromBackup.deleteSuccess",
-        { closeButton: true },
-      );
-    });
-    expect(refetchSkillBackupsMock).toHaveBeenCalledTimes(2);
-    expect(toastErrorMock).not.toHaveBeenCalled();
-    expect(consoleErrorSpy).toHaveBeenCalledWith(
-      "Failed to refresh Skill backups after deletion:",
-      expect.any(Error),
-    );
-    consoleErrorSpy.mockRestore();
+      within(dialog).getByText("skills.detailAgentEnabled"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("~/.codex/skills/alpha-directory"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("alpha-hash")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "skills.detailOpenDirectory" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("skills.detailPreviewEmpty")).toBeInTheDocument();
   });
 });

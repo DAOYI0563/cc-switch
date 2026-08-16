@@ -1,10 +1,21 @@
-// 前端统一使用 AppId 作为应用标识（与后端命令参数 `app` 一致）
-export type AppId =
-  | "claude"
-  | "claude-desktop"
-  | "codex"
-  | "gemini"
-  | "grokbuild"
-  | "opencode"
-  | "openclaw"
-  | "hermes";
+/** The complete production client registry. Keep this aligned with ManagedClientId. */
+export const MANAGED_APP_IDS = ["claude", "codex", "opencode"] as const;
+
+export type ManagedAppId = (typeof MANAGED_APP_IDS)[number];
+
+/** Enablement state shared by every resource that targets managed clients. */
+export type ManagedClientApps = Record<ManagedAppId, boolean>;
+
+export function isManagedAppId(value: unknown): value is ManagedAppId {
+  return (
+    typeof value === "string" && MANAGED_APP_IDS.includes(value as ManagedAppId)
+  );
+}
+
+export function readStoredManagedAppId(
+  storage: Pick<Storage, "getItem">,
+  key: string,
+): ManagedAppId {
+  const stored = storage.getItem(key);
+  return isManagedAppId(stored) ? stored : "claude";
+}

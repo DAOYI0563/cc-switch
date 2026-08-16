@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://claude.example.invalid",
+    "ANTHROPIC_AUTH_TOKEN": "{env:FIXTURE_CLAUDE_TOKEN}",
+    "FIXTURE_UNKNOWN_ENV": "preserve-me"
+  },
+  "model": "fixture-claude-model",
+  "permissions": {
+    "allow": ["Read(/workspace/**)"],
+    "futurePermissionMode": "preserve-me"
+  },
+  "futureTopLevel": {
+    "enabled": true,
+    "revision": 7
+  }
+}

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cc_switch_lib::{update_settings, AppSettings, AppState, Database, MultiAppConfig};
+use wsl_code_switch_lib::{update_settings, AppSettings, AppState, Database};
 
 /// 为测试设置隔离的 HOME 目录，避免污染真实用户数据。
 pub fn ensure_test_home() -> &'static Path {
@@ -26,16 +26,7 @@ pub fn ensure_test_home() -> &'static Path {
 /// 清理测试目录中生成的配置文件与缓存。
 pub fn reset_test_fs() {
     let home = ensure_test_home();
-    for sub in [
-        ".claude",
-        ".codex",
-        ".cc-switch",
-        ".gemini",
-        ".grok",
-        ".config",
-        ".openclaw",
-        "profiles",
-    ] {
+    for sub in [".claude", ".codex", ".wsl-code-switch", ".config"] {
         let path = home.join(sub);
         if path.exists() {
             if let Err(err) = std::fs::remove_dir_all(&path) {
@@ -52,15 +43,6 @@ pub fn reset_test_fs() {
     let _ = update_settings(AppSettings::default());
 }
 
-#[allow(dead_code)]
-pub fn enable_codex_official_auth_preservation() {
-    update_settings(AppSettings {
-        preserve_codex_official_auth_on_switch: true,
-        ..Default::default()
-    })
-    .expect("enable Codex official auth preservation");
-}
-
 /// 全局互斥锁，避免多测试并发写入相同的 HOME 目录。
 pub fn test_mutex() -> &'static Mutex<()> {
     static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -71,15 +53,5 @@ pub fn test_mutex() -> &'static Mutex<()> {
 #[allow(dead_code)]
 pub fn create_test_state() -> Result<AppState, Box<dyn std::error::Error>> {
     let db = Arc::new(Database::init()?);
-    Ok(AppState::new(db))
-}
-
-/// 创建测试用的 AppState，并从 MultiAppConfig 迁移数据
-#[allow(dead_code)]
-pub fn create_test_state_with_config(
-    config: &MultiAppConfig,
-) -> Result<AppState, Box<dyn std::error::Error>> {
-    let db = Arc::new(Database::init()?);
-    db.migrate_from_json(config)?;
     Ok(AppState::new(db))
 }

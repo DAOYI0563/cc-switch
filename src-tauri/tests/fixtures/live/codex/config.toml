@@ -1,0 +1,24 @@
+# This comment and all unknown fields must survive targeted updates.
+model_provider = "fixture_vendor"
+model = "fixture-codex-model"
+profile = "fixture_work"
+future_top_level = "preserve-me"
+
+[model_providers.fixture_vendor]
+name = "Fixture Vendor"
+base_url = "https://codex.example.invalid/v1"
+wire_api = "responses"
+requires_openai_auth = true
+future_provider_field = 42
+
+[profiles.fixture_work]
+model_provider = "fixture_vendor"
+model = "fixture-codex-model"
+future_profile_field = "preserve-me"
+
+[mcp_servers.fixture]
+command = "fixture-mcp"
+args = ["--stdio"]
+
+[future_section]
+nested = { enabled = true, label = "preserve-me" }

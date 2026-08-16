@@ -331,13 +331,6 @@ export const iconMetadata: Record<string, IconMetadata> = {
     keywords: [],
     defaultColor: "currentColor",
   },
-  gemini: {
-    name: "gemini",
-    displayName: "Gemini",
-    category: "ai-provider",
-    keywords: ["google"],
-    defaultColor: "#4285F4",
-  },
   gemma: {
     name: "gemma",
     displayName: "gemma",
@@ -477,20 +470,6 @@ export const iconMetadata: Record<string, IconMetadata> = {
     category: "ai-provider",
     keywords: ["gpt", "chatgpt"],
     defaultColor: "currentColor",
-  },
-  openclaw: {
-    name: "openclaw",
-    displayName: "OpenClaw",
-    category: "ai-provider",
-    keywords: ["openclaw", "lobster", "claw"],
-    defaultColor: "#ff4f40",
-  },
-  hermes: {
-    name: "hermes",
-    displayName: "Hermes",
-    category: "ai-provider",
-    keywords: ["hermes", "agent", "nous", "nousresearch"],
-    defaultColor: "#000000",
   },
   packycode: {
     name: "packycode",

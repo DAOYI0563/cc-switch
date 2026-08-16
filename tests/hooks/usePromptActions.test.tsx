@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { usePromptActions } from "@/hooks/usePromptActions";
-import type { AppId, Prompt } from "@/lib/api";
+import type { ManagedAppId, Prompt } from "@/lib/api";
 
 const mocks = vi.hoisted(() => ({
   getPrompts: vi.fn(),
@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => ({
   enablePrompt: vi.fn(),
   upsertPrompt: vi.fn(),
   deletePrompt: vi.fn(),
+  importFromFile: vi.fn(),
+  syncToLive: vi.fn(),
   toastError: vi.fn(),
   toastSuccess: vi.fn(),
 }));
@@ -21,6 +23,8 @@ vi.mock("@/lib/api", () => ({
     enablePrompt: mocks.enablePrompt,
     upsertPrompt: mocks.upsertPrompt,
     deletePrompt: mocks.deletePrompt,
+    importFromFile: mocks.importFromFile,
+    syncToLive: mocks.syncToLive,
   },
 }));
 
@@ -58,16 +62,20 @@ function makePrompts(id: string, name: string): Record<string, Prompt> {
     [id]: {
       id,
       name,
+      version: 1,
       content: `${name} content`,
       enabled: false,
     },
   };
 }
 
-function renderPromptActions(initialAppId: AppId) {
-  return renderHook(({ appId }: { appId: AppId }) => usePromptActions(appId), {
-    initialProps: { appId: initialAppId },
-  });
+function renderPromptActions(initialAppId: ManagedAppId) {
+  return renderHook(
+    ({ appId }: { appId: ManagedAppId }) => usePromptActions(appId),
+    {
+      initialProps: { appId: initialAppId },
+    },
+  );
 }
 
 describe("usePromptActions reload concurrency", () => {
@@ -78,9 +86,18 @@ describe("usePromptActions reload concurrency", () => {
     mocks.enablePrompt.mockReset();
     mocks.enablePrompt.mockResolvedValue(undefined);
     mocks.upsertPrompt.mockReset();
-    mocks.upsertPrompt.mockResolvedValue(undefined);
+    mocks.upsertPrompt.mockImplementation(
+      async (_app: ManagedAppId, _id: string, prompt: Prompt) => ({
+        ...prompt,
+        version: prompt.version || 1,
+      }),
+    );
     mocks.deletePrompt.mockReset();
     mocks.deletePrompt.mockResolvedValue(undefined);
+    mocks.importFromFile.mockReset();
+    mocks.importFromFile.mockResolvedValue("imported-version");
+    mocks.syncToLive.mockReset();
+    mocks.syncToLive.mockResolvedValue(undefined);
     mocks.toastError.mockReset();
     mocks.toastSuccess.mockReset();
   });
@@ -88,11 +105,11 @@ describe("usePromptActions reload concurrency", () => {
   it("does not let an older app request overwrite the current app", async () => {
     const claudeRequest = createDeferred<Record<string, Prompt>>();
     const codexRequest = createDeferred<Record<string, Prompt>>();
-    mocks.getPrompts.mockImplementation((appId: AppId) =>
+    mocks.getPrompts.mockImplementation((appId: ManagedAppId) =>
       appId === "claude" ? claudeRequest.promise : codexRequest.promise,
     );
     mocks.getCurrentFileContent.mockImplementation(
-      async (appId: AppId) => `${appId} live content`,
+      async (appId: ManagedAppId) => `${appId} live content`,
     );
 
     const { result, rerender } = renderPromptActions("claude");
@@ -166,7 +183,7 @@ describe("usePromptActions reload concurrency", () => {
   it("ignores an older request error while the current app is loading", async () => {
     const claudeRequest = createDeferred<Record<string, Prompt>>();
     const codexRequest = createDeferred<Record<string, Prompt>>();
-    mocks.getPrompts.mockImplementation((appId: AppId) =>
+    mocks.getPrompts.mockImplementation((appId: ManagedAppId) =>
       appId === "claude" ? claudeRequest.promise : codexRequest.promise,
     );
 
@@ -254,7 +271,7 @@ describe("usePromptActions reload concurrency", () => {
     const claudePrompts = makePrompts("claude-prompt", "Claude Prompt");
     const codexPrompts = makePrompts("codex-prompt", "Codex Prompt");
     const enableRequest = createDeferred<void>();
-    mocks.getPrompts.mockImplementation(async (appId: AppId) =>
+    mocks.getPrompts.mockImplementation(async (appId: ManagedAppId) =>
       appId === "claude" ? claudePrompts : codexPrompts,
     );
     mocks.enablePrompt.mockReturnValueOnce(enableRequest.promise);
@@ -295,12 +312,20 @@ describe("usePromptActions reload concurrency", () => {
     const savedPrompt: Prompt = {
       id: "saved",
       name: "Saved Prompt",
+      version: 0,
       content: "Saved content",
       enabled: false,
+    };
+    const authoritativePrompt: Prompt = {
+      ...savedPrompt,
+      version: 7,
+      createdAt: 101,
+      updatedAt: 202,
     };
     mocks.getPrompts
       .mockResolvedValueOnce(initialPrompts)
       .mockRejectedValueOnce(new Error("refresh failed"));
+    mocks.upsertPrompt.mockResolvedValueOnce(authoritativePrompt);
 
     const { result } = renderPromptActions("claude");
     await act(async () => {
@@ -315,11 +340,30 @@ describe("usePromptActions reload concurrency", () => {
     );
     expect(result.current.prompts).toEqual({
       ...initialPrompts,
-      saved: savedPrompt,
+      saved: authoritativePrompt,
     });
     expect(mocks.toastSuccess).toHaveBeenCalledWith("prompts.saveSuccess", {
       closeButton: true,
     });
+  });
+
+  it("binds manual import and live sync to the current client", async () => {
+    mocks.getPrompts.mockResolvedValue({});
+    const { result, rerender } = renderPromptActions("opencode");
+
+    await act(async () => {
+      expect(await result.current.importFromFile()).toBe(true);
+      expect(await result.current.syncToLive()).toBe(true);
+    });
+
+    expect(mocks.importFromFile).toHaveBeenCalledWith("opencode");
+    expect(mocks.syncToLive).toHaveBeenCalledWith("opencode");
+
+    rerender({ appId: "codex" });
+    await act(async () => {
+      expect(await result.current.importFromFile()).toBe(true);
+    });
+    expect(mocks.importFromFile).toHaveBeenLastCalledWith("codex");
   });
 
   it("keeps a deleted prompt removed when the follow-up reload fails", async () => {

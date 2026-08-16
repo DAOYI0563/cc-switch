@@ -1,32 +1,31 @@
-export type { AppId } from "./types";
-export { providersApi, universalProvidersApi } from "./providers";
+export {
+  MANAGED_APP_IDS,
+  isManagedAppId,
+  readStoredManagedAppId,
+} from "./types";
+export type { ManagedAppId, ManagedClientApps } from "./types";
+export { providersApi } from "./providers";
+export type { ProviderSwitchEvent, SwitchResult } from "./providers";
 export { settingsApi } from "./settings";
-export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
-export { profilesApi } from "./profiles";
-export { promptsApi } from "./prompts";
-export { skillsApi } from "./skills";
-export { usageApi } from "./usage";
-export { subscriptionApi } from "./subscription";
-export { vscodeApi } from "./vscode";
-export { proxyApi } from "./proxy";
-export { openclawApi } from "./openclaw";
-export { sessionsApi } from "./sessions";
-export { workspaceApi } from "./workspace";
-export * as configApi from "./config";
-export * as authApi from "./auth";
-export * as copilotApi from "./copilot";
-export type { ProviderSwitchEvent } from "./providers";
+export { promptsApi, PROMPT_LIVE_FILENAMES } from "./prompts";
 export type { Prompt } from "./prompts";
-export type { Profile, ProfilePayload, ProfilesResponse } from "./profiles";
+export { skillsApi } from "./skills";
+export { localScanApi, LOCAL_SCAN_DOMAINS } from "./local-scan";
+export type { LocalScanDomain } from "./local-scan";
+export { conflictCenterApi } from "./conflict-center";
 export type {
-  CopilotDeviceCodeResponse,
-  CopilotAuthStatus,
-  GitHubAccount,
-} from "./copilot";
-export type {
-  ManagedAuthProvider,
-  ManagedAuthAccount,
-  ManagedAuthStatus,
-  ManagedAuthDeviceCodeResponse,
-} from "./auth";
+  ConflictCenterDisposition,
+  ConflictCenterItem,
+  ConflictCenterSource,
+  ConflictResolutionAction,
+  ConflictResolutionRequest,
+  LocalConflictKind,
+  LocalDifferenceKind,
+  LocalScanFailureKind,
+  PortableDomain,
+} from "./conflict-center";
+export { sessionsApi } from "./sessions";
+export { cliStatusApi } from "./cli-status";
+export { dailyBriefApi } from "./daily-brief";
+export * as configApi from "./config";

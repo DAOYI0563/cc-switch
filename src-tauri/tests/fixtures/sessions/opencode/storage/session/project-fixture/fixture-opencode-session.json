@@ -1,0 +1,10 @@
+{
+  "id": "fixture-opencode-session",
+  "projectID": "project-fixture",
+  "title": "Fixture OpenCode Session",
+  "directory": "/workspace/fixture-project",
+  "time": {
+    "created": "2026-01-01T01:20:00Z",
+    "updated": "2026-01-01T01:20:05Z"
+  }
+}

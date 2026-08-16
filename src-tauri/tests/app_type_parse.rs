@@ -1,30 +1,35 @@
 use std::str::FromStr;
 
-use cc_switch_lib::AppType;
+use wsl_code_switch_lib::LegacyAppType;
 
 #[test]
 fn parse_known_apps_case_insensitive_and_trim() {
-    assert!(matches!(AppType::from_str("claude"), Ok(AppType::Claude)));
-    assert!(matches!(AppType::from_str("codex"), Ok(AppType::Codex)));
     assert!(matches!(
-        AppType::from_str("grokbuild"),
-        Ok(AppType::GrokBuild)
+        LegacyAppType::from_str("claude"),
+        Ok(LegacyAppType::Claude)
     ));
     assert!(matches!(
-        AppType::from_str("Grok-Build"),
-        Ok(AppType::GrokBuild)
+        LegacyAppType::from_str("codex"),
+        Ok(LegacyAppType::Codex)
     ));
     assert!(matches!(
-        AppType::from_str(" ClAuDe \n"),
-        Ok(AppType::Claude)
+        LegacyAppType::from_str("opencode"),
+        Ok(LegacyAppType::OpenCode)
     ));
-    assert!(matches!(AppType::from_str("\tcoDeX\t"), Ok(AppType::Codex)));
+    assert!(matches!(
+        LegacyAppType::from_str(" ClAuDe \n"),
+        Ok(LegacyAppType::Claude)
+    ));
+    assert!(matches!(
+        LegacyAppType::from_str("\tcoDeX\t"),
+        Ok(LegacyAppType::Codex)
+    ));
 }
 
 #[test]
 fn parse_unknown_app_returns_localized_error_message() {
-    let err = AppType::from_str("unknown").unwrap_err();
+    let err = LegacyAppType::from_str("unknown").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("可选值") || msg.contains("Allowed"));
+    assert!(msg.contains("仅允许"));
     assert!(msg.contains("unknown"));
 }

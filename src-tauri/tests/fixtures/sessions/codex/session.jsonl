@@ -1,0 +1,5 @@
+{"timestamp":"2026-01-01T01:10:00Z","type":"session_meta","payload":{"id":"fixture-codex-session","cwd":"/workspace/fixture-project","originator":"codex-tui","cli_version":"0.0.0-fixture"}}
+{"timestamp":"2026-01-01T01:10:01Z","type":"response_item","payload":{"type":"message","role":"user","content":"Inspect the fixture contract"}}
+{"timestamp":"2026-01-01T01:10:02Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"cmd\":[\"fixture-check\"]}","call_id":"fixture-call"}}
+{"timestamp":"2026-01-01T01:10:03Z","type":"response_item","payload":{"type":"function_call_output","call_id":"fixture-call","output":"fixture-ok"}}
+{"timestamp":"2026-01-01T01:10:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Fixture inspection completed."}]}}

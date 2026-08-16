@@ -80,9 +80,9 @@ export const SessionMessageItem = memo(function SessionMessageItem({
         <span className={cn("font-semibold", getRoleTone(message.role))}>
           {getRoleLabel(message.role, t)}
         </span>
-        {message.ts && (
+        {message.occurredAt && (
           <span className="text-muted-foreground">
-            {formatTimestamp(message.ts)}
+            {formatTimestamp(message.occurredAt)}
           </span>
         )}
       </div>

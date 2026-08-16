@@ -1,10 +1,10 @@
 import { Download, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import type { AppId } from "@/lib/api/types";
+import type { ManagedAppId } from "@/lib/api/types";
 
 interface ProviderEmptyStateProps {
-  appId: AppId;
+  appId: ManagedAppId;
   onCreate?: () => void;
   onImport?: () => void;
 }
@@ -15,8 +15,7 @@ export function ProviderEmptyState({
   onImport,
 }: ProviderEmptyStateProps) {
   const { t } = useTranslation();
-  const showSnippetHint =
-    appId === "claude" || appId === "codex" || appId === "gemini";
+  const showSnippetHint = appId === "claude" || appId === "codex";
 
   return (
     <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-border p-10 text-center">
@@ -36,11 +35,7 @@ export function ProviderEmptyState({
         {onImport && (
           <Button onClick={onImport}>
             <Download className="mr-2 h-4 w-4" />
-            {appId === "claude-desktop"
-              ? t("provider.importFromClaude", {
-                  defaultValue: "将 Claude Code 中已有的供应商导入",
-                })
-              : t("provider.importCurrent")}
+            {t("provider.importCurrent")}
           </Button>
         )}
         {onCreate && (

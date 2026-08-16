@@ -95,7 +95,7 @@ export function ThemeProvider({
     return () => mediaQuery.removeEventListener("change", handleChange);
   }, [theme]);
 
-  // Sync native window theme (Windows/macOS title bar)
+  // 同步 Windows 原生窗口主题。
   useEffect(() => {
     if (typeof window === "undefined") {
       return;

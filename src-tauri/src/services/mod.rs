@@ -1,50 +1,36 @@
-pub mod balance;
-pub mod codex_oauth_models;
-pub mod coding_plan;
-pub mod config;
-pub mod env_checker;
-pub mod env_manager;
+pub mod cli_status;
+pub mod common_snippet;
+pub mod conflict_center;
+pub mod daily_brief;
+pub mod local_scan;
+pub mod local_skill;
 pub mod mcp;
 pub mod model_fetch;
-pub mod model_pricing;
-pub mod omo;
-pub mod profile;
 pub mod prompt;
 pub mod provider;
-pub mod proxy;
-pub mod s3;
-pub mod s3_auto_sync;
-pub mod s3_sync;
-pub mod session_usage;
-pub mod session_usage_codex;
-pub mod session_usage_gemini;
-pub mod session_usage_grokbuild;
-pub mod session_usage_opencode;
-pub mod skill;
-pub mod speedtest;
-pub mod sql_helpers;
-pub mod stream_check;
-pub mod subscription;
-pub mod subscription_grok;
-pub mod sync_protocol;
-pub mod usage_cache;
-pub mod usage_stats;
-pub mod webdav;
-pub mod webdav_auto_sync;
-pub mod webdav_sync;
+#[cfg(any(target_os = "windows", test))]
+pub mod retained_migration;
+pub mod sync_v3;
 
-pub use config::ConfigService;
+pub use common_snippet::CommonSnippetService;
+pub use conflict_center::{
+    apply_committed_sync_batch, default_local_actions, list_conflict_center_items,
+    local_reconciliation_items, resolve_conflict_center_item, ConflictCenterRuntimeState,
+    InMemoryLocalReconciliationBaselines, LocalScanConflictSource, WebDavConflictSource,
+};
+pub use daily_brief::DailyBriefRuntimeState;
+pub use local_scan::{
+    reconciliation_snapshot_from_parsed, record_local_writes, record_runtime_local_writes,
+    LocalScanCadence, LocalScanCoordinator, LocalScanExecutor, LocalScanParsedChange,
+    LocalScanRuntimeState, LocalScanScheduler, LocalScanSchedulerError, LocalScanWorker,
+    LocalScanWriteRegistration, LocalScanWriteTracker,
+};
+pub use local_skill::LocalSkillService;
 pub use mcp::McpService;
-pub use omo::OmoService;
 pub use prompt::PromptService;
 pub use provider::{ProviderService, ProviderSortUpdate, SwitchResult};
-pub use proxy::ProxyService;
-#[allow(unused_imports)]
-pub use skill::{DiscoverableSkill, Skill, SkillRepo, SkillService};
-pub use speedtest::{EndpointLatency, SpeedtestService};
-pub use usage_cache::UsageCache;
-#[allow(unused_imports)]
-pub use usage_stats::{
-    DailyStats, LogFilters, ModelStats, PaginatedLogs, ProviderLimitStatus, ProviderStats,
-    RequestLogDetail, UsageSummary, UsageSummaryByApp,
+pub use sync_v3::{
+    sync_manifest_remote_path, sync_record_remote_path, SyncDeviceRetireRequest,
+    SyncFirstSyncConfirmRequest, SyncFirstSyncPreviewRequest, SyncRunError, SyncRunErrorCode,
+    SyncRunRequest, SyncRunResult, SyncV3Orchestrator,
 };

@@ -1,22 +1,24 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
-import { promptsApi, type Prompt, type AppId } from "@/lib/api";
+import { promptsApi, type Prompt, type ManagedAppId } from "@/lib/api";
 
 const EMPTY_PROMPTS: Record<string, Prompt> = {};
 
-export function usePromptActions(appId: AppId) {
+export function usePromptActions(appId: ManagedAppId) {
   const { t } = useTranslation();
   const [prompts, setPrompts] = useState<Record<string, Prompt>>({});
-  const [promptsAppId, setPromptsAppId] = useState<AppId | null>(null);
+  const [promptsAppId, setPromptsAppId] = useState<ManagedAppId | null>(null);
   const [loading, setLoading] = useState(false);
   const [currentFileContent, setCurrentFileContent] = useState<string | null>(
     null,
   );
-  const [currentFileAppId, setCurrentFileAppId] = useState<AppId | null>(null);
+  const [currentFileAppId, setCurrentFileAppId] = useState<ManagedAppId | null>(
+    null,
+  );
   const reloadGenerationRef = useRef(0);
   const currentAppIdRef = useRef(appId);
-  const promptsAppIdRef = useRef<AppId | null>(null);
+  const promptsAppIdRef = useRef<ManagedAppId | null>(null);
   currentAppIdRef.current = appId;
 
   const visiblePrompts = promptsAppId === appId ? prompts : EMPTY_PROMPTS;
@@ -25,7 +27,7 @@ export function usePromptActions(appId: AppId) {
 
   const updatePromptsForApp = useCallback(
     (
-      targetAppId: AppId,
+      targetAppId: ManagedAppId,
       updater: (current: Record<string, Prompt>) => Record<string, Prompt>,
     ) => {
       if (currentAppIdRef.current !== targetAppId) return;
@@ -90,10 +92,10 @@ export function usePromptActions(appId: AppId) {
   const savePrompt = useCallback(
     async (id: string, prompt: Prompt) => {
       try {
-        await promptsApi.upsertPrompt(appId, id, prompt);
+        const stored = await promptsApi.upsertPrompt(appId, id, prompt);
         updatePromptsForApp(appId, (current) => ({
           ...current,
-          [id]: prompt,
+          [id]: stored,
         }));
         const refreshed =
           currentAppIdRef.current === appId ? await reload() : false;
@@ -212,15 +214,37 @@ export function usePromptActions(appId: AppId) {
   );
 
   const importFromFile = useCallback(async () => {
+    const requestAppId = appId;
     try {
-      const id = await promptsApi.importFromFile(appId);
-      if (currentAppIdRef.current === appId) {
-        await reload();
+      await promptsApi.importFromFile(requestAppId);
+      const refreshed =
+        currentAppIdRef.current === requestAppId ? await reload() : false;
+      if (currentAppIdRef.current === requestAppId) {
+        toast.success(t("prompts.importSuccess"), { closeButton: true });
       }
-      toast.success(t("prompts.importSuccess"), { closeButton: true });
-      return id;
+      return refreshed;
     } catch (error) {
-      toast.error(t("prompts.importFailed"));
+      if (currentAppIdRef.current === requestAppId) {
+        toast.error(t("prompts.importFailed"));
+      }
+      throw error;
+    }
+  }, [appId, reload, t]);
+
+  const syncToLive = useCallback(async () => {
+    const requestAppId = appId;
+    try {
+      await promptsApi.syncToLive(requestAppId);
+      const refreshed =
+        currentAppIdRef.current === requestAppId ? await reload() : false;
+      if (currentAppIdRef.current === requestAppId) {
+        toast.success(t("prompts.syncSuccess"), { closeButton: true });
+      }
+      return refreshed;
+    } catch (error) {
+      if (currentAppIdRef.current === requestAppId) {
+        toast.error(t("prompts.syncFailed"));
+      }
       throw error;
     }
   }, [appId, reload, t]);
@@ -235,5 +259,6 @@ export function usePromptActions(appId: AppId) {
     enablePrompt,
     toggleEnabled,
     importFromFile,
+    syncToLive,
   };
 }

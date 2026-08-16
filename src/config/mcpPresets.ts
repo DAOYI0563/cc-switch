@@ -1,26 +1,15 @@
 import { McpServer, McpServerSpec } from "../types";
-import { isWindows } from "@/lib/platform";
+export type McpPreset = Omit<McpServer, "apps" | "enabled" | "description">;
 
-export type McpPreset = Omit<McpServer, "enabled" | "description">;
-
-// 创建跨平台 npx 命令配置
-// Windows 需要使用 cmd /c wrapper 来执行 npx.cmd
-// Mac/Linux 可以直接执行 npx
+// Windows 通过 cmd /c 执行 npx.cmd。
 const createNpxCommand = (
   packageName: string,
   extraArgs: string[] = [],
 ): { command: string; args: string[] } => {
-  if (isWindows()) {
-    return {
-      command: "cmd",
-      args: ["/c", "npx", ...extraArgs, packageName],
-    };
-  } else {
-    return {
-      command: "npx",
-      args: [...extraArgs, packageName],
-    };
-  }
+  return {
+    command: "cmd",
+    args: ["/c", "npx", ...extraArgs, packageName],
+  };
 };
 
 // 预设 MCP（逻辑简化版）：
@@ -98,7 +87,8 @@ export const getMcpPresetWithDescription = (
   return {
     ...preset,
     description: t(descriptionKey),
-  } as McpServer;
+    apps: { claude: false, codex: false, opencode: false },
+  };
 };
 
 export default mcpPresets;

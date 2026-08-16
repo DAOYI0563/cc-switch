@@ -1,72 +1,77 @@
 #![allow(non_snake_case)]
 
-mod auth;
-mod balance;
-mod codex_oauth;
-mod coding_plan;
+mod cli_status;
 mod config;
-mod copilot;
-mod deeplink;
-mod env;
-mod failover;
-mod global_proxy;
-mod hermes;
-mod import_export;
+mod conflict_center;
+mod daily_brief;
+mod local_scan;
 mod mcp;
 mod misc;
 mod model_fetch;
-mod omo;
-mod openclaw;
-mod plugin;
-mod profile;
 mod prompt;
 mod provider;
-mod proxy;
 mod session_manager;
 mod settings;
 pub mod skill;
-mod stream_check;
-mod subscription;
-mod sync_support;
-mod xai_oauth;
-
-mod lightweight;
-mod s3_sync;
-mod usage;
 mod webdav_sync;
-mod workspace;
 
-pub use auth::*;
-pub use balance::*;
-pub use codex_oauth::*;
-pub use coding_plan::*;
+use crate::app_config::LegacyAppType;
+use crate::domain::ManagedClientId;
+
+pub(crate) fn parse_managed_app_type(app: &str) -> Result<LegacyAppType, String> {
+    app.parse::<ManagedClientId>()
+        .map(LegacyAppType::from)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn parse_managed_client_id(app: &str) -> Result<ManagedClientId, String> {
+    app.parse::<ManagedClientId>()
+        .map_err(|error| error.to_string())
+}
+
+pub use cli_status::*;
 pub use config::*;
-pub use copilot::*;
-pub use deeplink::*;
-pub use env::*;
-pub use failover::*;
-pub use global_proxy::*;
-pub use hermes::*;
-pub use import_export::*;
+pub use conflict_center::*;
+pub use daily_brief::*;
+pub use local_scan::*;
 pub use mcp::*;
 pub use misc::*;
 pub use model_fetch::*;
-pub use omo::*;
-pub use openclaw::*;
-pub use plugin::*;
-pub use profile::*;
 pub use prompt::*;
 pub use provider::*;
-pub use proxy::*;
 pub use session_manager::*;
 pub use settings::*;
 pub use skill::*;
-pub use stream_check::*;
-pub use subscription::*;
-pub use xai_oauth::*;
-
-pub use lightweight::*;
-pub use s3_sync::*;
-pub use usage::*;
 pub use webdav_sync::*;
-pub use workspace::*;
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_managed_app_type, parse_managed_client_id};
+    use crate::app_config::LegacyAppType;
+    use crate::domain::ManagedClientId;
+
+    #[test]
+    fn production_command_boundary_accepts_exactly_three_clients() {
+        assert_eq!(
+            parse_managed_client_id("claude").unwrap(),
+            ManagedClientId::Claude
+        );
+        assert_eq!(
+            parse_managed_app_type("codex").unwrap(),
+            LegacyAppType::Codex
+        );
+        assert_eq!(
+            parse_managed_client_id(" OpenCode ").unwrap(),
+            ManagedClientId::Opencode
+        );
+        for unsupported in [
+            "claude-desktop",
+            "gemini",
+            "grokbuild",
+            "openclaw",
+            "hermes",
+        ] {
+            assert!(parse_managed_client_id(unsupported).is_err());
+        }
+    }
+}

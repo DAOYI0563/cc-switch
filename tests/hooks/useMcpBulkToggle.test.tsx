@@ -6,6 +6,7 @@ import {
   useBulkToggleMcpApp,
   useDeleteMcpServer,
   useImportMcpFromApps,
+  useSyncMcpToApps,
   useToggleMcpApp,
   useUpsertMcpServer,
 } from "@/hooks/useMcp";
@@ -15,6 +16,7 @@ const toggleAppMock = vi.hoisted(() => vi.fn());
 const upsertServerMock = vi.hoisted(() => vi.fn());
 const deleteServerMock = vi.hoisted(() => vi.fn());
 const importFromAppsMock = vi.hoisted(() => vi.fn());
+const syncToAppsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/api/mcp", () => ({
   mcpApi: {
@@ -22,6 +24,7 @@ vi.mock("@/lib/api/mcp", () => ({
     upsertUnifiedServer: upsertServerMock,
     deleteUnifiedServer: deleteServerMock,
     importFromApps: importFromAppsMock,
+    syncToApps: syncToAppsMock,
   },
 }));
 
@@ -39,6 +42,7 @@ describe("MCP management mutation hooks", () => {
     upsertServerMock.mockReset();
     deleteServerMock.mockReset();
     importFromAppsMock.mockReset();
+    syncToAppsMock.mockReset();
   });
 
   it("runs bulk writes serially and invalidates the list once", async () => {
@@ -240,5 +244,23 @@ describe("MCP management mutation hooks", () => {
       await mutation;
     });
     await waitFor(() => expect(result.current.isPending).toBe(false));
+  });
+
+  it("runs the explicit app-to-live synchronization without changing the list", async () => {
+    syncToAppsMock.mockResolvedValueOnce(undefined);
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
+    const { result } = renderHook(() => useSyncMcpToApps(), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync();
+    });
+
+    expect(syncToAppsMock).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });

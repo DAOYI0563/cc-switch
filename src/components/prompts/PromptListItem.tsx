@@ -38,8 +38,15 @@ const PromptListItem: React.FC<PromptListItemProps> = ({
           />
         </div>
 
-        <div className="flex-1 min-w-0">
-          <h3 className="font-medium text-foreground mb-1">{prompt.name}</h3>
+        <div className="min-w-0 flex-1">
+          <div className="mb-1 flex min-w-0 items-baseline gap-2">
+            <h3 className="truncate font-medium text-foreground">
+              {prompt.name}
+            </h3>
+            <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+              {t("prompts.version", { version: prompt.version })}
+            </span>
+          </div>
           {prompt.description && (
             <p className="text-sm text-muted-foreground truncate">
               {prompt.description}

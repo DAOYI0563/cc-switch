@@ -67,7 +67,7 @@ const extractCodexPromptFromIdeContext = (content: string) => {
 };
 
 export const getSessionKey = (session: SessionMeta) =>
-  `${session.providerId}:${session.sessionId}:${session.sourcePath ?? ""}`;
+  `${session.providerId}:${session.sessionId}`;
 
 export const getSessionDirectoryGroupKey = (
   providerId: string,
@@ -113,18 +113,22 @@ export const getProviderLabel = (
   providerId: string,
   t: (key: string) => string,
 ) => {
-  const key = `apps.${providerId}`;
+  const defaults: Record<string, string> = {
+    claude: "Claude Code",
+    codex: "Codex",
+    opencode: "OpenCode",
+  };
+  const key =
+    providerId === "claude" ? "apps.claudeCode" : `apps.${providerId}`;
   const translated = t(key);
-  return translated === key ? providerId : translated;
+  return translated === key ? (defaults[providerId] ?? providerId) : translated;
 };
 
 // 根据 providerId 获取对应的图标名称
 export const getProviderIconName = (providerId: string) => {
   if (providerId === "codex") return "openai";
-  if (providerId === "grokbuild") return "grok";
   if (providerId === "claude") return "claude";
   if (providerId === "opencode") return "opencode";
-  if (providerId === "openclaw") return "openclaw";
   return providerId;
 };
 

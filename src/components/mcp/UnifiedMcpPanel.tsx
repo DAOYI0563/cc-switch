@@ -10,9 +10,10 @@ import {
   useToggleMcpApp,
   useDeleteMcpServer,
   useImportMcpFromApps,
+  useSyncMcpToApps,
 } from "@/hooks/useMcp";
 import type { McpServer } from "@/types";
-import type { AppId } from "@/lib/api/types";
+import type { ManagedAppId } from "@/lib/api/types";
 import McpFormModal from "./McpFormModal";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { settingsApi } from "@/lib/api";
@@ -58,6 +59,7 @@ interface UnifiedMcpPanelProps {
 export interface UnifiedMcpPanelHandle {
   openAdd: () => void;
   openImport: () => void;
+  syncToApps: () => void;
 }
 
 const UnifiedMcpPanel = React.forwardRef<
@@ -82,12 +84,14 @@ const UnifiedMcpPanel = React.forwardRef<
   const bulkToggleAppMutation = useBulkToggleMcpApp();
   const deleteServerMutation = useDeleteMcpServer();
   const importMutation = useImportMcpFromApps();
+  const syncMutation = useSyncMcpToApps();
 
   const mutationPending =
     toggleAppMutation.isPending ||
     bulkToggleAppMutation.isPending ||
     deleteServerMutation.isPending ||
-    importMutation.isPending;
+    importMutation.isPending ||
+    syncMutation.isPending;
   const interactionBlocked =
     writePending || mutationPending || isFormOpen || confirmDialog !== null;
 
@@ -133,15 +137,10 @@ const UnifiedMcpPanel = React.forwardRef<
   }, [normalizedSearchQuery, serverEntries]);
 
   const enabledCounts = useMemo(() => {
-    const counts = {
+    const counts: Record<ManagedAppId, number> = {
       claude: 0,
-      "claude-desktop": 0,
       codex: 0,
-      gemini: 0,
-      grokbuild: 0,
       opencode: 0,
-      openclaw: 0,
-      hermes: 0,
     };
     serverEntries.forEach(([_, server]) => {
       for (const app of MCP_APP_IDS) {
@@ -151,7 +150,7 @@ const UnifiedMcpPanel = React.forwardRef<
     return counts;
   }, [serverEntries]);
 
-  const pendingApp = bulkToggleAppMutation.isPending
+  const pendingApp: ManagedAppId | null = bulkToggleAppMutation.isPending
     ? (bulkToggleAppMutation.variables?.app ?? null)
     : toggleAppMutation.isPending
       ? (toggleAppMutation.variables?.app ?? null)
@@ -159,7 +158,7 @@ const UnifiedMcpPanel = React.forwardRef<
 
   const handleToggleApp = async (
     serverId: string,
-    app: AppId,
+    app: ManagedAppId,
     enabled: boolean,
   ) => {
     if (!beginWrite()) return;
@@ -172,7 +171,7 @@ const UnifiedMcpPanel = React.forwardRef<
     }
   };
 
-  const handleToggleAll = async (app: AppId, enabled: boolean) => {
+  const handleToggleAll = async (app: ManagedAppId, enabled: boolean) => {
     if (!beginWrite()) return;
 
     // AppCountBar summarizes the complete collection, so its bulk action must
@@ -239,9 +238,24 @@ const UnifiedMcpPanel = React.forwardRef<
     }
   };
 
+  const handleSyncToApps = async () => {
+    if (!beginWrite()) return;
+    try {
+      await syncMutation.mutateAsync();
+      toast.success(t("mcp.unifiedPanel.syncSuccess"), { closeButton: true });
+    } catch (error) {
+      toast.error(t("mcp.unifiedPanel.syncFailed"), {
+        description: String(error),
+      });
+    } finally {
+      endWrite();
+    }
+  };
+
   React.useImperativeHandle(ref, () => ({
     openAdd: handleAdd,
     openImport: handleImport,
+    syncToApps: handleSyncToApps,
   }));
 
   const handleDelete = (id: string) => {
@@ -369,7 +383,7 @@ UnifiedMcpPanel.displayName = "UnifiedMcpPanel";
 interface UnifiedMcpListItemProps {
   id: string;
   server: McpServer;
-  onToggleApp: (serverId: string, app: AppId, enabled: boolean) => void;
+  onToggleApp: (serverId: string, app: ManagedAppId, enabled: boolean) => void;
   onEdit: (id: string) => void;
   onDelete: (id: string) => void;
   disabled?: boolean;

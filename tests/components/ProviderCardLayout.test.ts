@@ -17,10 +17,10 @@ describe("ProviderCard layout", () => {
 
   it("lets website links use available card width before truncating", () => {
     expect(source).not.toContain("max-w-[280px]");
-    expect(source).toContain("flex min-w-0 flex-1 items-center gap-2");
-    expect(source).toContain("min-w-0 flex-1 space-y-1");
+    expect(source).toContain("flex min-w-0 items-center gap-3");
+    expect(source).toContain('<div className="min-w-0">');
     expect(source).toContain(
-      "inline-flex max-w-full items-center overflow-hidden text-left text-sm",
+      "mt-1 block max-w-full truncate text-left text-xs text-muted-foreground",
     );
   });
 });

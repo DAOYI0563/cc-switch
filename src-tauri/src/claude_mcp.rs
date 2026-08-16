@@ -145,55 +145,6 @@ pub fn read_mcp_json() -> Result<Option<String>, AppError> {
     Ok(Some(content))
 }
 
-/// 在 ~/.claude.json 根对象写入 hasCompletedOnboarding=true（用于跳过 Claude Code 初次安装确认）
-/// 仅增量写入该字段，其他字段保持不变
-pub fn set_has_completed_onboarding() -> Result<bool, AppError> {
-    let path = user_config_path();
-    let mut root = if path.exists() {
-        read_json_value(&path)?
-    } else {
-        serde_json::json!({})
-    };
-
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::Config("~/.claude.json 根必须是对象".into()))?;
-
-    let already = obj
-        .get("hasCompletedOnboarding")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if already {
-        return Ok(false);
-    }
-
-    obj.insert("hasCompletedOnboarding".into(), Value::Bool(true));
-    write_json_value(&path, &root)?;
-    Ok(true)
-}
-
-/// 删除 ~/.claude.json 根对象的 hasCompletedOnboarding 字段（恢复 Claude Code 初次安装确认）
-/// 仅增量删除该字段，其他字段保持不变
-pub fn clear_has_completed_onboarding() -> Result<bool, AppError> {
-    let path = user_config_path();
-    if !path.exists() {
-        return Ok(false);
-    }
-
-    let mut root = read_json_value(&path)?;
-    let obj = root
-        .as_object_mut()
-        .ok_or_else(|| AppError::Config("~/.claude.json 根必须是对象".into()))?;
-
-    let existed = obj.remove("hasCompletedOnboarding").is_some();
-    if !existed {
-        return Ok(false);
-    }
-
-    write_json_value(&path, &root)?;
-    Ok(true)
-}
-
 pub fn upsert_mcp_server(id: &str, spec: Value) -> Result<bool, AppError> {
     if id.trim().is_empty() {
         return Err(AppError::InvalidInput("MCP 服务器 ID 不能为空".into()));
@@ -325,12 +276,13 @@ pub fn validate_command_in_path(cmd: &str) -> Result<bool, AppError> {
 
 /// 读取 ~/.claude.json 中的 mcpServers 映射
 pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>, AppError> {
-    let path = user_config_path();
-    if !path.exists() {
+    let Some(contents) = crate::adapters::mcp_live_files::McpLiveFileAdapter::runtime()
+        .read_optional(crate::domain::ManagedClientId::Claude)?
+    else {
         return Ok(std::collections::HashMap::new());
-    }
-
-    let root = read_json_value(&path)?;
+    };
+    let root: Value = serde_json::from_slice(&contents)
+        .map_err(|error| AppError::McpValidation(format!("解析 ~/.claude.json 失败: {error}")))?;
     let servers = root
         .get("mcpServers")
         .and_then(|v| v.as_object())
@@ -345,15 +297,17 @@ pub fn read_mcp_servers_map() -> Result<std::collections::HashMap<String, Value>
 pub fn set_mcp_servers_map(
     servers: &std::collections::HashMap<String, Value>,
 ) -> Result<(), AppError> {
-    let path = user_config_path();
-    let mut root = if path.exists() {
-        read_json_value(&path)?
-    } else {
-        serde_json::json!({})
+    let files = crate::adapters::mcp_live_files::McpLiveFileAdapter::runtime();
+    let mut root = match files.read_optional(crate::domain::ManagedClientId::Claude)? {
+        Some(contents) => serde_json::from_slice(&contents).map_err(|error| {
+            AppError::McpValidation(format!("解析 ~/.claude.json 失败: {error}"))
+        })?,
+        None => serde_json::json!({}),
     };
 
     // 构建 mcpServers 对象：移除 UI 辅助字段（enabled/source），仅保留实际 MCP 规范
     // 检测目标路径是否为 WSL，若是则跳过 cmd /c 包装
+    let path = user_config_path();
     let is_wsl_target = is_wsl_path(&path);
     if is_wsl_target {
         log::info!("检测到 WSL 路径，跳过 cmd /c 包装: {}", path.display());
@@ -399,15 +353,15 @@ pub fn set_mcp_servers_map(
         obj.insert("mcpServers".into(), Value::Object(out));
     }
 
-    write_json_value(&path, &root)?;
-    Ok(())
+    let contents =
+        serde_json::to_vec_pretty(&root).map_err(|source| AppError::JsonSerialize { source })?;
+    files.write(crate::domain::ManagedClientId::Claude, &contents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
     /// 测试 Windows 命令包装功能
     /// 由于使用条件编译，在非 Windows 平台上测试的是空函数
     #[test]

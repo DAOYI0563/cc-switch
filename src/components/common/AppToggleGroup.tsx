@@ -4,13 +4,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AppId } from "@/lib/api/types";
+import type { ManagedAppId } from "@/lib/api/types";
 import { APP_IDS, APP_ICON_MAP } from "@/config/appConfig";
 
 interface AppToggleGroupProps {
-  apps: Partial<Record<AppId, boolean>>;
-  onToggle: (app: AppId, enabled: boolean) => void;
-  appIds?: AppId[];
+  apps: Partial<Record<ManagedAppId, boolean>>;
+  onToggle: (app: ManagedAppId, enabled: boolean) => void;
+  appIds?: readonly ManagedAppId[];
   disabled?: boolean;
 }
 

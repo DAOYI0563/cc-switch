@@ -43,28 +43,4 @@ describe("useSettingsMetadata", () => {
     expect(result.current.isPortable).toBe(false);
     expect(result.current.isLoading).toBe(false);
   });
-
-  it("allows updating restart flag via setters", async () => {
-    isPortableMock.mockResolvedValue(false);
-
-    const { result } = renderHook(() => useSettingsMetadata());
-
-    await act(async () => {
-      await Promise.resolve();
-    });
-
-    await act(async () => {
-      result.current.setRequiresRestart(true);
-      await Promise.resolve();
-    });
-
-    expect(result.current.requiresRestart).toBe(true);
-
-    await act(async () => {
-      result.current.acknowledgeRestart();
-      await Promise.resolve();
-    });
-
-    expect(result.current.requiresRestart).toBe(false);
-  });
 });

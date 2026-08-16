@@ -65,20 +65,38 @@ jobs:
       - name: Run Windows-to-WSL2 filesystem contract
         shell: pwsh
         run: |
+          $testExe = Get-ChildItem -Path "src-tauri/target/debug/deps" -Filter "wsl_code_switch_lib-*.exe" -File |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+          if (-not $testExe) {
+            throw "Compiled Rust library test executable was not found"
+          }
+          $testList = & $testExe.FullName --ignored --list
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $testNames = @(
+            "config::tests::atomic_write_replaces_existing_wsl_unc_file",
+            "services::provider::tests::managed_provider_crud_roundtrip_on_wsl_unc",
+            "services::provider::tests::claude_special_writes_roundtrip_on_wsl_unc",
+            "services::provider::tests::codex_auth_preservation_roundtrip_on_wsl_unc",
+            "services::mcp::windows_tests::mcp_crud_sync_unknown_fields_and_rollback_on_wsl_unc",
+            "services::prompt::windows_tests::prompt_versions_import_sync_and_rollback_on_wsl_unc",
+            "services::local_skill::windows_tests::local_skill_copy_sync_conflict_and_link_rejection_on_wsl_unc"
+          )
+          foreach ($testName in $testNames) {
+            $expected = "${testName}: test"
+            if ($testList -notcontains $expected) {
+              throw "Expected ignored test was not discovered: $testName"
+            }
+          }
           $env:TEMP = $env:CC_SWITCH_WSL_TEST_TEMP
           $env:TMP = $env:CC_SWITCH_WSL_TEST_TEMP
-          $testName = "config::tests::atomic_write_replaces_existing_wsl_unc_file"
-          $testList = cargo test --tests --manifest-path src-tauri/Cargo.toml -- --ignored --list
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          $expected = "${testName}: test"
-          if ($testList -notcontains $expected) {
-            throw "Expected ignored test was not discovered: $testName"
-          }
-          cargo test --tests --manifest-path src-tauri/Cargo.toml $testName -- --ignored --exact --nocapture
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
+          foreach ($testName in $testNames) {
+            & $testExe.FullName $testName --ignored --exact --nocapture
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
           }
 
       - name: Run full test suite against WSL2-backed home

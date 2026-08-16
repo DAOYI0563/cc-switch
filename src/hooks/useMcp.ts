@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { mcpApi } from "@/lib/api/mcp";
 import type { McpServer } from "@/types";
-import type { AppId } from "@/lib/api/types";
+import type { ManagedAppId } from "@/lib/api/types";
 import { runSequentialBulkAction } from "@/lib/utils/sequentialBulkAction";
 
 /**
@@ -21,8 +21,7 @@ export function useUpsertMcpServer() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (server: McpServer) => mcpApi.upsertUnifiedServer(server),
-    // The database is updated before live configs are synchronized, so an
-    // error can still leave a persisted change that the list must reflect.
+    // Refresh the authoritative row after both commit and compensated failure.
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: ["mcp", "all"] }),
   });
@@ -38,7 +37,7 @@ export function useBulkToggleMcpApp() {
       enabled,
     }: {
       serverIds: string[];
-      app: AppId;
+      app: ManagedAppId;
       enabled: boolean;
     }) =>
       runSequentialBulkAction(serverIds, (serverId) =>
@@ -61,11 +60,9 @@ export function useToggleMcpApp() {
       enabled,
     }: {
       serverId: string;
-      app: AppId;
+      app: ManagedAppId;
       enabled: boolean;
     }) => mcpApi.toggleApp(serverId, app, enabled),
-    // The backend may update the database before a live-config write fails.
-    // Always refresh so the UI reflects the persisted state after an error.
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: ["mcp", "all"] }),
   });
@@ -78,8 +75,6 @@ export function useDeleteMcpServer() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => mcpApi.deleteUnifiedServer(id),
-    // Deletion reaches the database before live-config cleanup, so refresh
-    // after both success and failure to avoid operating on a removed entry.
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: ["mcp", "all"] }),
   });
@@ -96,5 +91,12 @@ export function useImportMcpFromApps() {
     // 服务器已经入库，失败时也要刷新列表。
     onSettled: () =>
       queryClient.invalidateQueries({ queryKey: ["mcp", "all"] }),
+  });
+}
+
+/** Manually project application state to all three live configurations. */
+export function useSyncMcpToApps() {
+  return useMutation({
+    mutationFn: () => mcpApi.syncToApps(),
   });
 }

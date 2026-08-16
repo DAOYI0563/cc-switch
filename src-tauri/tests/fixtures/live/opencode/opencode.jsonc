@@ -1,0 +1,36 @@
+{
+  // JSONC comments are accepted on input. Semantic unknown fields must survive.
+  "$schema": "https://opencode.ai/config.json",
+  "model": "fixture_vendor/fixture-model",
+  "theme": "fixture-theme",
+  "futureTopLevel": { "preserve": true },
+  "provider": {
+    "fixture_vendor": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Fixture Vendor",
+      "futureProviderField": { "revision": 3 },
+      "options": {
+        "baseURL": "https://opencode.example.invalid/v1",
+        "apiKey": "{env:FIXTURE_OPENCODE_TOKEN}",
+        "timeout": 30000,
+        "futureOption": "preserve-me"
+      },
+      "models": {
+        "fixture-model": {
+          "name": "Fixture Model",
+          "limit": { "context": 32000, "output": 4096 },
+          "modalities": { "input": ["text"], "output": ["text"] },
+          "futureModelField": true
+        }
+      }
+    }
+  },
+  "mcp": {
+    "fixture": {
+      "type": "local",
+      "command": ["fixture-mcp", "--stdio"],
+      "enabled": true,
+      "futureMcpField": "preserve-me"
+    }
+  }
+}

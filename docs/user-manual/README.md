@@ -1,22 +1,78 @@
-# CC Switch User Manual / 用户手册 / ユーザーマニュアル
+# WSL Code Switch 用户手册
 
-> Claude Code / Claude Desktop / Codex / Gemini CLI / OpenCode / OpenClaw / Hermes
+本文档适用于 Windows 11 x64、WSL2 `Ubuntu`、用户 `zhldm` 和 Windows Terminal。
 
-## Language / 语言 / 言語
+## 1. 启动与便携使用
 
-| Language | Link |
-|----------|------|
-| [中文](./zh/README.md) | 简体中文用户手册 |
-| [English](./en/README.md) | English User Manual |
-| [日本語](./ja/README.md) | 日本語ユーザーマニュアル |
+直接运行便携 EXE。应用数据与目标 CLI 配置仍保存在固定的 Windows/WSL 用户目录中，因此移动 EXE 不会移动这些数据。关闭窗口时可按设置隐藏到托盘。
 
-## Version / 版本 / バージョン
+## 2. 供应商
 
-- Documentation version: v3.16.0
-- Last updated: 2026-05-29
-- Compatible with CC Switch v3.16.0+
+顶部客户端切换器只包含 Claude Code、Codex 和 OpenCode。
 
-## Links
+1. 选择目标客户端。
+2. 点击“导入当前配置”读取 WSL live 配置，或点击“添加供应商”手动创建。
+3. 填写名称、接口地址、API Key 和目标客户端配置。
+4. Claude Code/Codex 使用“切换”；OpenCode 使用“加入配置”或“移出 live 配置”。
+5. 可编辑、复制、排序或删除应用内供应商记录。
 
-- [GitHub Issues](https://github.com/farion1231/cc-switch/issues)
-- [GitHub Repository](https://github.com/farion1231/cc-switch)
+写入失败时应用会保留原文件，不会以空配置覆盖。
+
+## 3. MCP、Prompt 与 Skill
+
+- MCP：统一查看三端 MCP，启停某一客户端或同步到 live 配置。
+- Prompt：管理 Claude Code 的 `CLAUDE.md`、Codex 的 `AGENTS.md` 和 OpenCode 对应提示文件。
+- Skill：只管理本地已安装 Skill，可扫描、导入、启停和卸载；不提供在线商店或 ZIP 安装。
+
+进入 Skill 页后，可点击页头或空状态中的“导入已有”。应用会打开对话框并显示扫描进度，读取 Claude Code、Codex 和 OpenCode 的现有 Skill；扫描完成后勾选需要纳入管理的项目，再点击“导入已选”。每项默认只选择“内容来源”对应的一个客户端，不会隐式覆盖其他客户端的同名目录；如需复制到其他端，可再明确勾选目标。单个损坏的 `SKILL.md` 不会阻止其他有效 Skill 显示，Windows `:Zone.Identifier` 元数据不计入内容变化，列表或扫描失败时页面会给出错误和重试入口。
+
+这些页面的批量操作按顺序执行，失败项会单独报告。
+
+## 4. 本地扫描与冲突中心
+
+“扫描”读取三端 WSL live 配置并分类为新增、已修改、已删除或冲突。扫描本身只读。
+
+需要写入时，在冲突中心选择“采用 WSL 配置”或“采用应用状态”，并确认操作。写入前会创建加密临时回滚点，成功后清理；最多保留 3 个。
+
+## 5. 会话
+
+会话页只读解析三个 CLI 的本地会话文件，可按客户端、项目目录、日期和关键词过滤。点击“恢复会话”会使用参数数组启动 Windows Terminal 与对应 CLI，不修改会话源文件。
+
+原始会话和派生索引永不进入 WebDAV 同步。
+
+## 6. CLI 状态
+
+应用显示三个 CLI 的当前版本、安装渠道、官方最新版本和建议升级命令。升级命令仅供复制，应用不会自动安装或执行。
+
+## 7. 每日工作简报
+
+简报按北京时间处理前一自然日，也可手动生成或重新生成。生成前会对会话输入脱敏，并限制分块、请求次数、token 总量和总运行时间。
+
+完成的简报保存为无脚本、无外链的离线 HTML。只有状态完整且哈希校验通过的简报可以进入加密同步；失败版本和续跑检查点不会上传。
+
+## 8. 手动 WebDAV 同步
+
+1. 在设置中填写 WebDAV 地址、账户、密码、远程根目录和同步配置名。
+2. 点击“测试连接”；该操作不会保存配置。
+3. 点击“保存配置”；保存不会隐式启动同步。
+4. 输入本次同步口令和设备名称，首次使用先点击“首次同步预览”。
+5. 检查新增、修改、删除和冲突数量，确认后注册设备。
+6. 后续输入同步口令并点击“立即同步”。
+
+同步只由按钮触发，不存在定时任务、后台重试或自动上传。远端使用逐记录合并、永久墓碑和 ETag 条件写；并发冲突进入冲突中心。设备管理可查看和退役已登记设备。
+
+WebDAV 密码保存到 Windows Credential Manager；同步口令不写入设置或远端。若口令错误、密文被篡改、manifest 非法或第二次 ETag 竞争发生，同步会停止且不覆盖有效数据。
+
+## 9. 设置与托盘
+
+设置页保留主题、开机自启、静默启动、关闭时隐藏和 WebDAV。托盘保留打开应用、Claude/Codex/OpenCode 供应商切换和退出。
+
+应用固定使用简体中文。便携版不包含应用内更新器，升级时用新 EXE 替换旧 EXE。
+
+## 10. 故障排查
+
+- 确认 `wsl.exe -d Ubuntu -u zhldm -- sh -lc 'echo ok'` 可运行。
+- 确认 Windows Terminal 命令 `wt.exe` 可用。
+- 在 CLI 状态页检查目标 CLI 是否安装。
+- WebDAV 失败时先单独测试连接，再检查远程根目录和同步口令。
+- 诊断日志会脱敏，但提交前仍应人工检查不含隐私数据。

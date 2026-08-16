@@ -9,19 +9,13 @@ use super::utils::{parse_timestamp_to_ms, path_basename, truncate_summary};
 
 const PROVIDER_ID: &str = "opencode";
 
-/// Return the OpenCode base directory (`$XDG_DATA_HOME/opencode`).
-///
-/// Respects `XDG_DATA_HOME` on all platforms; falls back to
-/// `~/.local/share/opencode/`.
+/// Return the fixed read-only OpenCode session-data root in WSL.
 pub(crate) fn get_opencode_base_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("opencode");
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".local/share/opencode"))
-        .unwrap_or_else(|| PathBuf::from(".local/share/opencode"))
+    use crate::ports::WslPathResolver;
+
+    crate::adapters::wsl_paths::FixedWslPathResolver::runtime()
+        .opencode_session_data_root()
+        .windows
 }
 
 /// Return the OpenCode JSON storage directory (legacy flat-file layout).
@@ -313,113 +307,6 @@ pub fn load_messages_sqlite(source: &str) -> Result<Vec<SessionMessage>, String>
     Ok(messages)
 }
 
-pub fn delete_session(storage: &Path, path: &Path, session_id: &str) -> Result<bool, String> {
-    if path.file_name().and_then(|name| name.to_str()) != Some(session_id) {
-        return Err(format!(
-            "OpenCode session path does not match session ID: expected {session_id}, found {}",
-            path.display()
-        ));
-    }
-
-    let mut message_files = Vec::new();
-    collect_json_files(path, &mut message_files);
-
-    let mut message_ids = Vec::new();
-    for message_path in &message_files {
-        let data = match std::fs::read_to_string(message_path) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        let value: Value = match serde_json::from_str(&data) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if let Some(message_id) = value.get("id").and_then(Value::as_str) {
-            message_ids.push(message_id.to_string());
-        }
-    }
-
-    for message_id in &message_ids {
-        let part_dir = storage.join("part").join(message_id);
-        remove_dir_all_if_exists(&part_dir).map_err(|e| {
-            format!(
-                "Failed to delete OpenCode part directory {}: {e}",
-                part_dir.display()
-            )
-        })?;
-    }
-
-    let session_diff_path = storage
-        .join("session_diff")
-        .join(format!("{session_id}.json"));
-    remove_file_if_exists(&session_diff_path).map_err(|e| {
-        format!(
-            "Failed to delete OpenCode session diff {}: {e}",
-            session_diff_path.display()
-        )
-    })?;
-
-    remove_dir_all_if_exists(path).map_err(|e| {
-        format!(
-            "Failed to delete OpenCode message directory {}: {e}",
-            path.display()
-        )
-    })?;
-
-    if let Some(session_file) = find_session_file(storage, session_id) {
-        remove_file_if_exists(&session_file).map_err(|e| {
-            format!(
-                "Failed to delete OpenCode session file {}: {e}",
-                session_file.display()
-            )
-        })?;
-    }
-
-    Ok(true)
-}
-
-/// Delete a session from the OpenCode SQLite database.
-pub fn delete_session_sqlite(session_id: &str, source: &str) -> Result<bool, String> {
-    let (db_path, ref_session_id) = parse_sqlite_source(source)
-        .ok_or_else(|| format!("Invalid SQLite source reference: {source}"))?;
-    let db_path = db_path
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize SQLite database path: {e}"))?;
-    let expected_db_path = get_opencode_db_path()
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize expected OpenCode database path: {e}"))?;
-
-    if ref_session_id != session_id {
-        return Err(format!(
-            "OpenCode SQLite session ID mismatch: expected {session_id}, found {ref_session_id}"
-        ));
-    }
-    if db_path != expected_db_path {
-        return Err("SQLite path does not match expected OpenCode database".to_string());
-    }
-
-    let conn =
-        Connection::open(&db_path).map_err(|e| format!("Failed to open OpenCode database: {e}"))?;
-
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| format!("Failed to begin transaction: {e}"))?;
-
-    tx.execute("DELETE FROM part WHERE session_id = ?1", [session_id])
-        .map_err(|e| format!("Failed to delete OpenCode parts: {e}"))?;
-    tx.execute("DELETE FROM message WHERE session_id = ?1", [session_id])
-        .map_err(|e| format!("Failed to delete OpenCode messages: {e}"))?;
-
-    let deleted = tx
-        .execute("DELETE FROM session WHERE id = ?1", [session_id])
-        .map_err(|e| format!("Failed to delete OpenCode session: {e}"))?;
-
-    tx.commit()
-        .map_err(|e| format!("Failed to commit session deletion: {e}"))?;
-
-    Ok(deleted > 0)
-}
-
 fn parse_session(storage: &Path, path: &Path) -> Option<SessionMeta> {
     let data = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&data).ok()?;
@@ -595,33 +482,6 @@ fn collect_json_files(root: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn find_session_file(storage: &Path, session_id: &str) -> Option<PathBuf> {
-    let session_root = storage.join("session");
-    let mut files = Vec::new();
-    collect_json_files(&session_root, &mut files);
-    let expected = format!("{session_id}.json");
-
-    files
-        .into_iter()
-        .find(|path| path.file_name().and_then(|name| name.to_str()) == Some(expected.as_str()))
-}
-
-fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-fn remove_dir_all_if_exists(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +492,27 @@ mod tests {
     fn opencode_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestHomeGuard(Option<std::ffi::OsString>);
+
+    impl TestHomeGuard {
+        #[allow(deprecated)]
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", home);
+            Self(previous)
+        }
+    }
+
+    impl Drop for TestHomeGuard {
+        #[allow(deprecated)]
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("CC_SWITCH_TEST_HOME", previous),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+        }
     }
 
     fn create_sqlite_schema(conn: &Connection) {
@@ -664,67 +545,6 @@ mod tests {
             ",
         )
         .expect("create sqlite schema");
-    }
-
-    #[test]
-    fn delete_session_removes_session_diff_messages_and_parts() {
-        let temp = tempdir().expect("tempdir");
-        let storage = temp.path();
-        let project_id = "project-123";
-        let session_id = "ses_123";
-        let session_dir = storage.join("session").join(project_id);
-        let message_dir = storage.join("message").join(session_id);
-        let session_diff = storage
-            .join("session_diff")
-            .join(format!("{session_id}.json"));
-        let part_dir = storage.join("part").join("msg_1");
-        let session_file = session_dir.join(format!("{session_id}.json"));
-
-        std::fs::create_dir_all(&session_dir).expect("create session dir");
-        std::fs::create_dir_all(&message_dir).expect("create message dir");
-        std::fs::create_dir_all(&part_dir).expect("create part dir");
-        std::fs::create_dir_all(storage.join("project")).expect("create project dir");
-        std::fs::create_dir_all(storage.join("session_diff")).expect("create session diff dir");
-
-        std::fs::write(
-            &session_file,
-            format!(
-                r#"{{
-                  "id": "{session_id}",
-                  "projectID": "{project_id}",
-                  "directory": "/tmp/project",
-                  "time": {{ "created": 1, "updated": 2 }}
-                }}"#
-            ),
-        )
-        .expect("write session file");
-        std::fs::write(
-            message_dir.join("msg_1.json"),
-            format!(r#"{{"id":"msg_1","sessionID":"{session_id}","role":"user"}}"#),
-        )
-        .expect("write message file");
-        std::fs::write(
-            part_dir.join("prt_1.json"),
-            r#"{"id":"prt_1","messageID":"msg_1"}"#,
-        )
-        .expect("write part file");
-        std::fs::write(&session_diff, "[]").expect("write session diff");
-        std::fs::write(
-            storage.join("project").join(format!("{project_id}.json")),
-            r#"{"id":"project-123"}"#,
-        )
-        .expect("write project file");
-
-        delete_session(storage, &message_dir, session_id).expect("delete session");
-
-        assert!(!session_file.exists());
-        assert!(!message_dir.exists());
-        assert!(!session_diff.exists());
-        assert!(!part_dir.exists());
-        assert!(storage
-            .join("project")
-            .join(format!("{project_id}.json"))
-            .exists());
     }
 
     #[test]
@@ -780,14 +600,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // set_var/remove_var deprecated since Rust 1.81; safe here under mutex
     fn scan_sessions_sqlite_reads_temp_database() {
         let _guard = opencode_env_lock().lock().expect("lock");
         let temp = tempdir().expect("tempdir");
-        let original_xdg = std::env::var_os("XDG_DATA_HOME");
-        std::env::set_var("XDG_DATA_HOME", temp.path());
+        let _home = TestHomeGuard::set(temp.path());
 
-        let base_dir = temp.path().join("opencode");
+        let base_dir = temp.path().join(".local/share/opencode");
         std::fs::create_dir_all(&base_dir).expect("create base dir");
         let db_path = base_dir.join("opencode.db");
         let conn = Connection::open(&db_path).expect("open sqlite db");
@@ -806,13 +624,6 @@ mod tests {
         drop(conn);
 
         let sessions = scan_sessions_sqlite();
-
-        #[allow(deprecated)]
-        if let Some(value) = original_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
 
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].session_id, "ses_2");
@@ -892,110 +703,5 @@ mod tests {
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "[Tool: bash]\nDone");
         assert_eq!(messages[1].ts, Some(2000));
-    }
-
-    #[test]
-    fn delete_session_sqlite_removes_session() {
-        let _guard = opencode_env_lock().lock().expect("lock");
-        let temp = tempdir().expect("tempdir");
-        let original_xdg = std::env::var_os("XDG_DATA_HOME");
-        #[allow(deprecated)]
-        std::env::set_var("XDG_DATA_HOME", temp.path());
-
-        let base_dir = temp.path().join("opencode");
-        std::fs::create_dir_all(&base_dir).expect("create base dir");
-        let db_path = base_dir.join("opencode.db");
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        create_sqlite_schema(&conn);
-
-        conn.execute(
-            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("ses_1", "Session", "/tmp/project-a", 1000_i64, 3000_i64),
-        )
-        .expect("insert session");
-        conn.execute(
-            "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
-            ("msg_1", "ses_1", 1000_i64, r#"{"role":"user"}"#),
-        )
-        .expect("insert message");
-        conn.execute(
-            "INSERT INTO part (id, session_id, message_id, time_created, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("prt_1", "ses_1", "msg_1", 1000_i64, r#"{"type":"text","text":"Hello"}"#),
-        )
-        .expect("insert part");
-        drop(conn);
-
-        let source = format!("sqlite:{}:ses_1", db_path.display());
-        let deleted = delete_session_sqlite("ses_1", &source).expect("delete sqlite session");
-        assert!(deleted);
-
-        let conn = Connection::open(&db_path).expect("re-open sqlite db");
-        let remaining_sessions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM session WHERE id = 'ses_1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count sessions");
-        let remaining_messages: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM message WHERE session_id = 'ses_1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count messages");
-        let remaining_parts: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM part WHERE session_id = 'ses_1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count parts");
-
-        assert_eq!(remaining_sessions, 0);
-        assert_eq!(remaining_messages, 0);
-        assert_eq!(remaining_parts, 0);
-
-        #[allow(deprecated)]
-        if let Some(value) = original_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
-    }
-
-    #[test]
-    fn delete_session_sqlite_rejects_foreign_db_path() {
-        let _guard = opencode_env_lock().lock().expect("lock");
-        let temp = tempdir().expect("tempdir");
-        let original_xdg = std::env::var_os("XDG_DATA_HOME");
-        #[allow(deprecated)]
-        std::env::set_var("XDG_DATA_HOME", temp.path());
-
-        let expected_base_dir = temp.path().join("opencode");
-        std::fs::create_dir_all(&expected_base_dir).expect("create expected base dir");
-        let expected_db_path = expected_base_dir.join("opencode.db");
-        Connection::open(&expected_db_path).expect("create expected sqlite db");
-
-        let db_path = temp.path().join("foreign.db");
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        create_sqlite_schema(&conn);
-        conn.execute(
-            "INSERT INTO session (id, title, directory, time_created, time_updated) VALUES (?1, ?2, ?3, ?4, ?5)",
-            ("ses_1", "Session", "/tmp/project", 1000_i64, 3000_i64),
-        )
-        .expect("insert session");
-        drop(conn);
-
-        let source = format!("sqlite:{}:ses_1", db_path.display());
-        let err = delete_session_sqlite("ses_1", &source).expect_err("should reject foreign db");
-        assert!(err.contains("expected OpenCode database"));
-
-        #[allow(deprecated)]
-        if let Some(value) = original_xdg {
-            std::env::set_var("XDG_DATA_HOME", value);
-        } else {
-            std::env::remove_var("XDG_DATA_HOME");
-        }
     }
 }

@@ -5,10 +5,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import MarkdownEditor from "@/components/MarkdownEditor";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
-import type { Prompt, AppId } from "@/lib/api";
+import {
+  PROMPT_LIVE_FILENAMES,
+  type Prompt,
+  type ManagedAppId,
+} from "@/lib/api";
 
 interface PromptFormPanelProps {
-  appId: AppId;
+  appId: ManagedAppId;
   editingId?: string;
   initialData?: Prompt;
   onSave: (id: string, prompt: Prompt) => Promise<void | boolean>;
@@ -24,17 +28,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
 }) => {
   const { t } = useTranslation();
   const appName = t(`apps.${appId}`);
-  const filenameMap: Record<AppId, string> = {
-    claude: "CLAUDE.md",
-    "claude-desktop": "CLAUDE.md",
-    codex: "AGENTS.md",
-    gemini: "GEMINI.md",
-    grokbuild: "AGENTS.md",
-    opencode: "AGENTS.md",
-    openclaw: "AGENTS.md",
-    hermes: "SOUL.md",
-  };
-  const filename = filenameMap[appId];
+  const filename = PROMPT_LIVE_FILENAMES[appId];
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [content, setContent] = useState("");
@@ -78,6 +72,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
       const prompt: Prompt = {
         id,
         name: name.trim(),
+        version: initialData?.version ?? 0,
         description: description.trim() || undefined,
         content: content.trim(),
         enabled: initialData?.enabled || false,

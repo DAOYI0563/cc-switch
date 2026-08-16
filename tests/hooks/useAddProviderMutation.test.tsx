@@ -3,13 +3,9 @@ import { act, renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useAddProviderMutation } from "@/lib/query/mutations";
-import type { Provider } from "@/types";
 
 const apiMocks = vi.hoisted(() => ({
   add: vi.fn(),
-  ensureClaudeDesktopOfficialProvider: vi.fn(),
-  ensureCodexOfficialProvider: vi.fn(),
-  getAll: vi.fn(),
   updateTrayMenu: vi.fn(),
 }));
 
@@ -20,11 +16,6 @@ const uuidMocks = vi.hoisted(() => ({
 vi.mock("@/lib/api", () => ({
   providersApi: {
     add: (...args: unknown[]) => apiMocks.add(...args),
-    ensureClaudeDesktopOfficialProvider: (...args: unknown[]) =>
-      apiMocks.ensureClaudeDesktopOfficialProvider(...args),
-    ensureCodexOfficialProvider: (...args: unknown[]) =>
-      apiMocks.ensureCodexOfficialProvider(...args),
-    getAll: (...args: unknown[]) => apiMocks.getAll(...args),
     updateTrayMenu: (...args: unknown[]) => apiMocks.updateTrayMenu(...args),
   },
   sessionsApi: {},
@@ -59,112 +50,85 @@ function createWrapper() {
 
 beforeEach(() => {
   apiMocks.add.mockReset().mockResolvedValue(true);
-  apiMocks.ensureClaudeDesktopOfficialProvider
-    .mockReset()
-    .mockResolvedValue(true);
-  apiMocks.ensureCodexOfficialProvider.mockReset().mockResolvedValue(true);
-  apiMocks.getAll.mockReset().mockResolvedValue({});
   apiMocks.updateTrayMenu.mockReset().mockResolvedValue(true);
   uuidMocks.generateUUID.mockReset().mockReturnValue("generated-uuid");
 });
 
 describe("useAddProviderMutation", () => {
-  it("duplicates Claude Desktop official providers with a fresh id", async () => {
+  it("creates a Claude provider with a generated id", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(
-      () => useAddProviderMutation("claude-desktop"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAddProviderMutation("claude"), {
+      wrapper,
+    });
 
-    const duplicatedProvider = await act(async () =>
+    const createdProvider = await act(async () =>
       result.current.mutateAsync({
-        name: "Claude Desktop Official copy",
+        name: "Claude Custom",
         settingsConfig: { env: {} },
-        category: "official",
+        category: "custom",
       }),
     );
 
-    expect(apiMocks.ensureClaudeDesktopOfficialProvider).not.toHaveBeenCalled();
     expect(apiMocks.add).toHaveBeenCalledTimes(1);
     expect(apiMocks.add).toHaveBeenCalledWith(
       expect.objectContaining({
         id: "generated-uuid",
-        name: "Claude Desktop Official copy",
-        category: "official",
+        name: "Claude Custom",
+        category: "custom",
       }),
-      "claude-desktop",
+      "claude",
       undefined,
     );
-    expect(duplicatedProvider.id).toBe("generated-uuid");
-    expect(duplicatedProvider.id).not.toBe("claude-desktop-official");
+    expect(createdProvider.id).toBe("generated-uuid");
   });
 
-  it("returns the persisted seed row for the Claude Desktop official preset", async () => {
-    const seedProvider: Provider = {
-      id: "claude-desktop-official",
-      name: "Claude Desktop Official",
-      settingsConfig: { env: {} },
-      websiteUrl: "https://claude.ai/download",
-      category: "official",
-      icon: "anthropic",
-      iconColor: "#D4915D",
-      createdAt: 123,
-    };
-    apiMocks.getAll.mockResolvedValueOnce({
-      "claude-desktop-official": seedProvider,
-    });
+  it("uses the OpenCode provider key as the stable id", async () => {
     const { wrapper } = createWrapper();
-    const { result } = renderHook(
-      () => useAddProviderMutation("claude-desktop"),
-      { wrapper },
-    );
+    const { result } = renderHook(() => useAddProviderMutation("opencode"), {
+      wrapper,
+    });
 
-    const persistedProvider = await act(async () =>
+    const createdProvider = await act(async () =>
       result.current.mutateAsync({
-        name: "Renamed by form",
-        settingsConfig: { env: { ignored: true } },
-        websiteUrl: "https://example.invalid",
-        category: "official",
-        icon: "custom-icon",
-        ensureClaudeDesktopOfficialSeed: true,
+        name: "OpenCode Custom",
+        settingsConfig: {
+          npm: "@ai-sdk/openai-compatible",
+          options: {},
+          models: {},
+        },
+        category: "custom",
+        providerKey: "custom-provider",
       }),
     );
 
-    expect(apiMocks.ensureClaudeDesktopOfficialProvider).toHaveBeenCalledTimes(
-      1,
+    expect(apiMocks.add).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "custom-provider" }),
+      "opencode",
+      undefined,
     );
-    expect(apiMocks.getAll).toHaveBeenCalledWith("claude-desktop");
-    expect(apiMocks.add).not.toHaveBeenCalled();
-    expect(persistedProvider).toEqual(seedProvider);
+    expect(createdProvider.id).toBe("custom-provider");
+    expect(createdProvider).not.toHaveProperty("providerKey");
   });
 
-  it("recreates and returns the fixed Codex official seed", async () => {
-    const seedProvider: Provider = {
-      id: "codex-official",
-      name: "OpenAI Official",
-      settingsConfig: { auth: {}, config: "" },
-      category: "official",
-    };
-    apiMocks.getAll.mockResolvedValueOnce({
-      "codex-official": seedProvider,
-    });
+  it("creates a Codex provider with a generated id", async () => {
     const { wrapper } = createWrapper();
     const { result } = renderHook(() => useAddProviderMutation("codex"), {
       wrapper,
     });
 
-    const persistedProvider = await act(async () =>
+    const createdProvider = await act(async () =>
       result.current.mutateAsync({
-        name: "OpenAI Official",
+        name: "Codex Custom",
         settingsConfig: { auth: {}, config: "" },
-        category: "official",
-        ensureCodexOfficialSeed: true,
+        category: "custom",
       }),
     );
 
-    expect(apiMocks.ensureCodexOfficialProvider).toHaveBeenCalledTimes(1);
-    expect(apiMocks.getAll).toHaveBeenCalledWith("codex");
-    expect(apiMocks.add).not.toHaveBeenCalled();
-    expect(persistedProvider).toEqual(seedProvider);
+    expect(apiMocks.add).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "generated-uuid", name: "Codex Custom" }),
+      "codex",
+      undefined,
+    );
+    expect(createdProvider.id).toBe("generated-uuid");
   });
 });

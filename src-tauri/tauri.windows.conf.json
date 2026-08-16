@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "CC Switch",
+        "title": "WSL Code Switch",
         "titleBarStyle": "Visible",
         "visible": false,
         "minWidth": 900,

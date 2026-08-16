@@ -56,10 +56,10 @@ describe("AddProviderDialog", () => {
           },
         },
       },
-    };
+    } as unknown as ProviderFormValues;
   });
 
-  it("使用 ProviderForm 返回的自定义端点", async () => {
+  it("删除 ProviderForm 返回的旧测速元数据", async () => {
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
     const handleOpenChange = vi.fn();
 
@@ -81,13 +81,11 @@ describe("AddProviderDialog", () => {
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
 
     const submitted = handleSubmit.mock.calls[0][0];
-    expect(submitted.meta?.custom_endpoints).toEqual(
-      mockFormValues.meta?.custom_endpoints,
-    );
+    expect(submitted.meta).toBeUndefined();
     expect(handleOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("在缺少自定义端点时回退到配置中的 baseUrl", async () => {
+  it("不再从 Base URL 生成测速端点", async () => {
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
     mockFormValues = {
@@ -117,35 +115,20 @@ describe("AddProviderDialog", () => {
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
 
     const submitted = handleSubmit.mock.calls[0][0];
-    expect(submitted.meta?.custom_endpoints).toEqual({
-      "https://claude.base": {
-        url: "https://claude.base",
-        addedAt: expect.any(Number),
-        lastUsed: undefined,
-      },
-    });
+    expect(submitted.meta).toBeUndefined();
   });
 
-  it("新建 Grok Build 自定义供应商时不补默认 Grok 图标", async () => {
+  it("OpenCode 保留 provider key 且不生成测速端点", async () => {
     const handleSubmit = vi.fn().mockResolvedValue(undefined);
 
     mockFormValues = {
-      name: "tes 1",
+      name: "OpenCode Custom",
       websiteUrl: "",
-      icon: "",
-      iconColor: "",
+      providerKey: "custom-provider",
       settingsConfig: JSON.stringify({
-        config: `[models]
-default = "grok-4.5"
-
-[model."grok-4.5"]
-model = "grok-4.5"
-base_url = "https://grok.example.com/v1"
-name = "tes 1"
-api_key = "secret"
-api_backend = "responses"
-context_window = 500000
-`,
+        npm: "@ai-sdk/openai-compatible",
+        options: { baseURL: "https://opencode.example.com/v1" },
+        models: {},
       }),
     };
 
@@ -153,7 +136,7 @@ context_window = 500000
       <AddProviderDialog
         open
         onOpenChange={vi.fn()}
-        appId="grokbuild"
+        appId="opencode"
         onSubmit={handleSubmit}
       />,
     );
@@ -163,7 +146,7 @@ context_window = 500000
     await waitFor(() => expect(handleSubmit).toHaveBeenCalledTimes(1));
 
     const submitted = handleSubmit.mock.calls[0][0];
-    expect(submitted.icon).toBeUndefined();
-    expect(submitted.iconColor).toBeUndefined();
+    expect(submitted.providerKey).toBe("custom-provider");
+    expect(submitted.meta).toBeUndefined();
   });
 });

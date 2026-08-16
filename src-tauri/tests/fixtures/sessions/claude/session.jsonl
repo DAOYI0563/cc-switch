@@ -1,0 +1,3 @@
+{"type":"summary","summary":"Fixture session summary","leafUuid":"fixture-leaf"}
+{"type":"user","sessionId":"fixture-claude-session","uuid":"fixture-claude-user-1","timestamp":"2026-01-01T09:00:00+08:00","cwd":"/workspace/fixture-project","message":{"role":"user","content":"Review the fixture configuration"}}
+{"type":"assistant","sessionId":"fixture-claude-session","uuid":"fixture-claude-assistant-1","timestamp":"2026-01-01T09:00:05+08:00","message":{"role":"assistant","content":[{"type":"text","text":"The fixture configuration is valid."}]}}

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::app_config::{McpApps, McpConfig, McpServer, MultiAppConfig};
 use crate::error::AppError;
 
-use super::validation::{extract_server_spec, validate_server_spec};
+use super::validation::{extract_server_spec, merge_preserving_unknown, validate_server_spec};
 
 fn should_sync_claude_mcp() -> bool {
     // Claude 未安装/未初始化时：通常 ~/.claude 目录与 ~/.claude.json 都不存在。
@@ -49,14 +49,10 @@ pub fn sync_enabled_to_claude(config: &MultiAppConfig) -> Result<(), AppError> {
 /// 从 ~/.claude.json 导入 mcpServers 到统一结构（v3.7.0+）
 /// 已存在的服务器将启用 Claude 应用，不覆盖其他字段和应用状态
 pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError> {
-    let text_opt = crate::claude_mcp::read_mcp_json()?;
-    let Some(text) = text_opt else { return Ok(0) };
-
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| AppError::McpValidation(format!("解析 ~/.claude.json 失败: {e}")))?;
-    let Some(map) = v.get("mcpServers").and_then(|x| x.as_object()) else {
+    let map = crate::claude_mcp::read_mcp_servers_map()?;
+    if map.is_empty() {
         return Ok(0);
-    };
+    }
 
     // 确保新结构存在
     let servers = config.mcp.servers.get_or_insert_with(HashMap::new);
@@ -64,7 +60,7 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
     let mut changed = 0;
     let mut errors = Vec::new();
 
-    for (id, spec) in map.iter() {
+    for (id, spec) in &map {
         // 校验：单项失败不中止，收集错误继续处理
         if let Err(e) = validate_server_spec(spec) {
             log::warn!("跳过无效 MCP 服务器 '{id}': {e}");
@@ -90,10 +86,7 @@ pub fn import_from_claude(config: &mut MultiAppConfig) -> Result<usize, AppError
                     apps: McpApps {
                         claude: true,
                         codex: false,
-                        gemini: false,
-                        grokbuild: false,
                         opencode: false,
-                        hermes: false,
                     },
                     description: None,
                     homepage: None,
@@ -127,7 +120,12 @@ pub fn sync_single_server_to_claude(
 
     // 创建新的 HashMap，包含现有的所有服务器 + 当前要同步的服务器
     let mut updated = current;
-    updated.insert(id.to_string(), server_spec.clone());
+    let merged = merge_preserving_unknown(
+        updated.get(id),
+        server_spec,
+        &["type", "command", "args", "env", "cwd", "url", "headers"],
+    )?;
+    updated.insert(id.to_string(), merged);
 
     // 写回
     crate::claude_mcp::set_mcp_servers_map(&updated)

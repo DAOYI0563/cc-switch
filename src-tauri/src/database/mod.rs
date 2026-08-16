@@ -24,42 +24,23 @@
 //! ```
 
 pub(crate) mod backup;
+mod core_schema;
 mod dao;
-mod migration;
+mod retained_migration;
 mod schema;
 
-#[cfg(test)]
-mod tests;
-
 // DAO 类型导出供外部使用
-pub(crate) use dao::providers_seed::{
-    is_official_seed_id, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
-    GROKBUILD_OFFICIAL_PROVIDER_ID,
-};
-pub(crate) use dao::proxy::{
-    validate_cost_multiplier, validate_pricing_source, PRICING_SOURCE_REQUEST,
-    PRICING_SOURCE_RESPONSE,
-};
-pub use dao::FailoverQueueItem;
-pub use dao::Profile;
-
 use crate::config::get_app_config_dir;
 use crate::error::AppError;
-use rusqlite::{hooks::Action, Connection};
-use serde::Serialize;
+pub use dao::daily_brief::{DailyBriefDeviceIdentity, DailyBriefRecord};
+use rusqlite::Connection;
 use std::sync::Mutex;
 
 // DAO 方法通过 impl Database 提供，无需额外导出
 
 /// 当前 Schema 版本号
 /// 每次修改表结构时递增，并在 schema.rs 中添加相应的迁移逻辑
-pub(crate) const SCHEMA_VERSION: i32 = 16;
-
-/// 安全地序列化 JSON，避免 unwrap panic
-pub(crate) fn to_json_string<T: Serialize>(value: &T) -> Result<String, AppError> {
-    serde_json::to_string(value)
-        .map_err(|e| AppError::Config(format!("JSON serialization failed: {e}")))
-}
+pub(crate) const SCHEMA_VERSION: i32 = 18;
 
 /// 安全地获取 Mutex 锁，避免 unwrap panic
 macro_rules! lock_conn {
@@ -81,22 +62,10 @@ pub struct Database {
     pub(crate) conn: Mutex<Connection>,
 }
 
-fn register_db_change_hook(conn: &Connection) {
-    conn.update_hook(Some(
-        |action: Action, _database: &str, table: &str, _row_id: i64| match action {
-            Action::SQLITE_INSERT | Action::SQLITE_UPDATE | Action::SQLITE_DELETE => {
-                crate::services::webdav_auto_sync::notify_db_changed(table);
-                crate::services::s3_auto_sync::notify_db_changed(table);
-            }
-            _ => {}
-        },
-    ));
-}
-
 impl Database {
     /// 初始化数据库连接并创建表
     ///
-    /// 数据库文件位于 `~/.cc-switch/cc-switch.db`
+    /// 数据库文件位于 `~/.wsl-code-switch/cc-switch.db`
     pub fn init() -> Result<Self, AppError> {
         let db_path = get_app_config_dir().join("cc-switch.db");
         let db_exists = db_path.exists();
@@ -117,52 +86,24 @@ impl Database {
             conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
-        register_db_change_hook(&conn);
+
+        // Inspect and protect an existing database before create_tables() can
+        // repair or otherwise mutate any legacy schema objects.
+        let initial_version = Self::get_user_version(&conn)?;
+        if initial_version > SCHEMA_VERSION {
+            return Err(AppError::Database(format!(
+                "数据库版本过新（{initial_version}），当前应用仅支持 {SCHEMA_VERSION}，请升级应用后再尝试。"
+            )));
+        }
 
         let db = Self {
             conn: Mutex::new(conn),
         };
         db.create_tables()?;
-
-        // Pre-migration backup: only when upgrading from an existing database
-        {
-            let conn = lock_conn!(db.conn);
-            let version = Self::get_user_version(&conn)?;
-            drop(conn);
-            if version > 0 && version < SCHEMA_VERSION {
-                log::info!(
-                    "Creating pre-migration database backup (v{version} → v{SCHEMA_VERSION})"
-                );
-                if let Err(e) = db.backup_database_file() {
-                    log::warn!("Pre-migration backup failed, continuing migration: {e}");
-                }
-            }
-        }
-
         db.apply_schema_migrations()?;
         if let Err(e) = db.ensure_incremental_auto_vacuum() {
             log::warn!("Failed to ensure incremental auto-vacuum: {e}");
         }
-        db.ensure_model_pricing_seeded()?;
-        if let Err(e) = crate::services::model_pricing::sync_local_model_pricing(&db) {
-            log::warn!("Failed to sync local model pricing file: {e}");
-        }
-
-        // Startup cleanup: prune old logs and reclaim space
-        if let Err(e) = db.cleanup_old_stream_check_logs(7) {
-            log::warn!("Startup stream_check_logs cleanup failed: {e}");
-        }
-        if let Err(e) = db.rollup_and_prune(30) {
-            log::warn!("Startup rollup_and_prune failed: {e}");
-        }
-        // Reclaim disk space after cleanup
-        {
-            let conn = lock_conn!(db.conn);
-            if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum;") {
-                log::warn!("Startup incremental vacuum failed: {e}");
-            }
-        }
-
         Ok(db)
     }
 
@@ -191,14 +132,11 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("PRAGMA auto_vacuum = INCREMENTAL;", [])
             .map_err(|e| AppError::Database(e.to_string()))?;
-        register_db_change_hook(&conn);
-
         let db = Self {
             conn: Mutex::new(conn),
         };
         db.create_tables()?;
-        db.ensure_model_pricing_seeded()?;
-
+        db.apply_schema_migrations()?;
         Ok(db)
     }
 
@@ -255,10 +193,7 @@ impl Database {
             Self::has_user_tables(&conn)?
         };
         if has_tables {
-            log::info!(
-                "Detected auto_vacuum={mode}, rebuilding database to enable incremental vacuum"
-            );
-            self.backup_database_file()?;
+            log::info!("Detected auto_vacuum={mode}, rebuilding database in place");
         }
 
         let rebuilt = {
@@ -279,7 +214,9 @@ impl Database {
     pub fn is_mcp_table_empty(&self) -> Result<bool, AppError> {
         let conn = lock_conn!(self.conn);
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM mcp_servers", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM core_mcp_servers", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(count == 0)
     }
@@ -288,7 +225,9 @@ impl Database {
     pub fn is_prompts_table_empty(&self) -> Result<bool, AppError> {
         let conn = lock_conn!(self.conn);
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM prompts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM core_prompt_versions", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| AppError::Database(e.to_string()))?;
         Ok(count == 0)
     }

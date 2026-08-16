@@ -1,54 +1,40 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionMessage, SessionMeta } from "@/types";
-
-export interface DeleteSessionOptions {
-  providerId: string;
-  sessionId: string;
-  sourcePath: string;
-}
-
-export interface DeleteSessionResult extends DeleteSessionOptions {
-  success: boolean;
-  error?: string;
-}
+import type {
+  SessionMessage,
+  SessionMeta,
+  SessionPage,
+  SessionSearchRequest,
+} from "@/types";
 
 export const sessionsApi = {
   async list(): Promise<SessionMeta[]> {
     return await invoke("list_sessions");
   },
 
+  async search(
+    request: SessionSearchRequest,
+  ): Promise<SessionPage<SessionMeta>> {
+    return await invoke("search_sessions", { request });
+  },
+
   async getMessages(
     providerId: string,
-    sourcePath: string,
-  ): Promise<SessionMessage[]> {
-    return await invoke("get_session_messages", { providerId, sourcePath });
-  },
-
-  async delete(options: DeleteSessionOptions): Promise<boolean> {
-    const { providerId, sessionId, sourcePath } = options;
-    return await invoke("delete_session", {
+    sessionId: string,
+    offset = 0,
+    limit = 200,
+  ): Promise<SessionPage<SessionMessage>> {
+    return await invoke("get_session_messages", {
       providerId,
       sessionId,
-      sourcePath,
+      offset,
+      limit,
     });
-  },
-
-  async deleteMany(
-    items: DeleteSessionOptions[],
-  ): Promise<DeleteSessionResult[]> {
-    return await invoke("delete_sessions", { items });
   },
 
   async launchTerminal(options: {
-    command: string;
-    cwd?: string | null;
-    customConfig?: string | null;
+    providerId: string;
+    sessionId: string;
   }): Promise<boolean> {
-    const { command, cwd, customConfig } = options;
-    return await invoke("launch_session_terminal", {
-      command,
-      cwd,
-      customConfig,
-    });
+    return await invoke("launch_session_terminal", options);
   },
 };

@@ -1,53 +1,45 @@
+import type { ComponentType, MouseEvent, ReactNode } from "react";
 import { Monitor, Moon, Sun } from "lucide-react";
+
+import { useTheme } from "@/components/theme-provider";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { useTranslation } from "react-i18next";
-import { useTheme } from "@/components/theme-provider";
 
 export function ThemeSettings() {
-  const { t } = useTranslation();
   const { theme, setTheme } = useTheme();
-
   return (
     <section className="space-y-2">
-      <header className="space-y-1">
-        <h3 className="text-sm font-medium">{t("settings.theme")}</h3>
-        <p className="text-xs text-muted-foreground">
-          {t("settings.themeHint")}
+      <header>
+        <h3 className="text-sm font-medium">主题</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          选择浅色、深色或跟随 Windows。
         </p>
       </header>
-      <div className="inline-flex gap-1 rounded-md border border-border-default bg-background p-1">
+      <div className="inline-flex gap-1 rounded-md border border-border-default p-1">
         <ThemeButton
           active={theme === "light"}
           onClick={() => setTheme("light")}
           icon={Sun}
         >
-          {t("settings.themeLight")}
+          浅色
         </ThemeButton>
         <ThemeButton
           active={theme === "dark"}
           onClick={() => setTheme("dark")}
           icon={Moon}
         >
-          {t("settings.themeDark")}
+          深色
         </ThemeButton>
         <ThemeButton
           active={theme === "system"}
           onClick={() => setTheme("system")}
           icon={Monitor}
         >
-          {t("settings.themeSystem")}
+          跟随系统
         </ThemeButton>
       </div>
     </section>
   );
-}
-
-interface ThemeButtonProps {
-  active: boolean;
-  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
-  icon: React.ComponentType<{ className?: string }>;
-  children: React.ReactNode;
 }
 
 function ThemeButton({
@@ -55,19 +47,19 @@ function ThemeButton({
   onClick,
   icon: Icon,
   children,
-}: ThemeButtonProps) {
+}: {
+  active: boolean;
+  onClick: (event: MouseEvent<HTMLButtonElement>) => void;
+  icon: ComponentType<{ className?: string }>;
+  children: ReactNode;
+}) {
   return (
     <Button
       type="button"
-      onClick={onClick}
       size="sm"
       variant={active ? "default" : "ghost"}
-      className={cn(
-        "min-w-[96px] gap-1.5",
-        active
-          ? "shadow-sm"
-          : "text-muted-foreground hover:text-foreground hover:bg-muted",
-      )}
+      onClick={onClick}
+      className={cn("min-w-[88px] gap-1.5", !active && "text-muted-foreground")}
     >
       <Icon className="h-3.5 w-3.5" />
       {children}

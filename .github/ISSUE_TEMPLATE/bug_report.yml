@@ -20,7 +20,7 @@ body:
 
   - type: input
     attributes:
-      label: CC Switch Version / 版本号
+      label: WSL Code Switch Version / 版本号
       description: |
         See the Settings page in the app.
         查看应用设置页面中的版本号。
@@ -34,8 +34,6 @@ body:
       multiple: false
       options:
         - Windows
-        - macOS
-        - Linux
     validations:
       required: true
 
@@ -49,9 +47,7 @@ body:
       options:
         - Claude Code
         - Codex
-        - Gemini CLI
         - OpenCode
-        - OpenClaw
         - Other / 其他
     validations:
       required: true

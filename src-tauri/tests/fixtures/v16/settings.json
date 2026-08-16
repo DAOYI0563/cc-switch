@@ -1,0 +1,22 @@
+{
+  "launchOnStartup": true,
+  "silentStartup": true,
+  "skipClaudeOnboarding": true,
+  "preserveCodexOfficialAuthOnSwitch": true,
+  "enableLocalProxy": true,
+  "showProfileSwitcher": true,
+  "usageDashboardRefreshIntervalMs": 30000,
+  "s3Sync": {
+    "accessKeyId": "FIXTURE_S3_ACCESS_KEY",
+    "secretAccessKey": "FIXTURE_S3_SECRET"
+  },
+  "webdavSync": {
+    "enabled": true,
+    "autoSync": true,
+    "baseUrl": "https://webdav.example.invalid/dav",
+    "username": "fixture-user",
+    "password": "FIXTURE_WEBDAV_PASSWORD",
+    "remoteRoot": "cc-switch-sync",
+    "profile": "legacy-profile"
+  }
+}

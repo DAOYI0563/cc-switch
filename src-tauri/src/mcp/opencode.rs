@@ -1,10 +1,10 @@
 //! OpenCode MCP 同步和导入模块
 //!
-//! 本模块处理 CC Switch 统一 MCP 格式与 OpenCode 格式之间的转换。
+//! 本模块处理 WSL Code Switch 统一 MCP 格式与 OpenCode 格式之间的转换。
 //!
 //! ## 格式差异
 //!
-//! | CC Switch 统一格式    | OpenCode 格式       |
+//! | WSL Code Switch 统一格式    | OpenCode 格式       |
 //! |----------------------|---------------------|
 //! | `type: "stdio"`      | `type: "local"`     |
 //! | `command` + `args`   | `command: [cmd, ...args]` |
@@ -32,10 +32,10 @@ fn should_sync_opencode_mcp() -> bool {
 }
 
 // ============================================================================
-// Format Conversion: CC Switch → OpenCode
+// Format Conversion: WSL Code Switch → OpenCode
 // ============================================================================
 
-/// Convert CC Switch unified format to OpenCode format
+/// Convert WSL Code Switch unified format to OpenCode format
 ///
 /// Conversion rules:
 /// - `stdio` → `local`, command+args → command array, env → environment
@@ -47,7 +47,10 @@ pub fn convert_to_opencode_format(spec: &Value) -> Result<Value, AppError> {
 
     let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
 
-    let mut result = serde_json::Map::new();
+    let mut result = obj.clone();
+    for field in ["type", "command", "args", "env", "url", "headers"] {
+        result.remove(field);
+    }
 
     match typ {
         "stdio" => {
@@ -104,10 +107,10 @@ pub fn convert_to_opencode_format(spec: &Value) -> Result<Value, AppError> {
 }
 
 // ============================================================================
-// Format Conversion: OpenCode → CC Switch
+// Format Conversion: OpenCode → WSL Code Switch
 // ============================================================================
 
-/// Convert OpenCode format to CC Switch unified format
+/// Convert OpenCode format to WSL Code Switch unified format
 ///
 /// Conversion rules:
 /// - `local` → `stdio`, command array → command+args, environment → env
@@ -119,7 +122,17 @@ pub fn convert_from_opencode_format(spec: &Value) -> Result<Value, AppError> {
 
     let typ = obj.get("type").and_then(|v| v.as_str()).unwrap_or("local");
 
-    let mut result = serde_json::Map::new();
+    let mut result = obj.clone();
+    for field in [
+        "type",
+        "command",
+        "environment",
+        "url",
+        "headers",
+        "enabled",
+    ] {
+        result.remove(field);
+    }
 
     match typ {
         "local" => {
@@ -193,8 +206,18 @@ pub fn sync_single_server_to_opencode(
     // Convert to OpenCode format
     let opencode_spec = convert_to_opencode_format(server_spec)?;
 
-    // Set in OpenCode config
-    opencode_config::set_mcp_server(id, opencode_spec)
+    opencode_config::set_mcp_server_preserving_unknown(
+        id,
+        opencode_spec,
+        &[
+            "type",
+            "command",
+            "environment",
+            "url",
+            "headers",
+            "enabled",
+        ],
+    )
 }
 
 /// Remove a single MCP server from OpenCode live config
@@ -257,10 +280,7 @@ pub fn import_from_opencode(config: &mut MultiAppConfig) -> Result<usize, AppErr
                     apps: McpApps {
                         claude: false,
                         codex: false,
-                        gemini: false,
-                        grokbuild: false,
                         opencode: true,
-                        hermes: false,
                     },
                     description: None,
                     homepage: None,

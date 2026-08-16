@@ -1,0 +1,7 @@
+{
+  "id": "fixture-opencode-part",
+  "messageID": "fixture-opencode-message",
+  "sessionID": "fixture-opencode-session",
+  "type": "text",
+  "text": "Inspect the OpenCode fixture contract"
+}

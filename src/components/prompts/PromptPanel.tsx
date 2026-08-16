@@ -1,9 +1,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FileText, Search } from "lucide-react";
-import { type AppId } from "@/lib/api";
+import { PROMPT_LIVE_FILENAMES, type ManagedAppId } from "@/lib/api";
 import { usePromptActions } from "@/hooks/usePromptActions";
-import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { ManagementListSearch } from "@/components/common/ManagementListSearch";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import PromptListItem from "./PromptListItem";
@@ -13,13 +12,15 @@ import { ConfirmDialog } from "../ConfirmDialog";
 interface PromptPanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  appId: AppId;
+  appId: ManagedAppId;
   onInteractionBlockedChange?: (blocked: boolean) => void;
   onNavigationBlockedChange?: (blocked: boolean) => void;
 }
 
 export interface PromptPanelHandle {
   openAdd: () => void;
+  importFromLive: () => void;
+  syncToLive: () => void;
 }
 
 const PromptPanel = React.forwardRef<PromptPanelHandle, PromptPanelProps>(
@@ -53,6 +54,8 @@ const PromptPanel = React.forwardRef<PromptPanelHandle, PromptPanelProps>(
       savePrompt,
       deletePrompt,
       toggleEnabled,
+      importFromFile,
+      syncToLive: syncPromptToLive,
     } = usePromptActions(appId);
     const reloadRef = React.useRef(reload);
     reloadRef.current = reload;
@@ -129,25 +132,6 @@ const PromptPanel = React.forwardRef<PromptPanelHandle, PromptPanelProps>(
       }
     }, [appId, runExternalReload]);
 
-    // Listen for prompt import events from deep link
-    useEffect(() => {
-      const handlePromptImported = (event: Event) => {
-        const customEvent = event as CustomEvent;
-        // Reload if the import is for this app
-        if (customEvent.detail?.app === appId) {
-          void runExternalReload();
-        }
-      };
-
-      window.addEventListener("prompt-imported", handlePromptImported);
-      return () => {
-        window.removeEventListener("prompt-imported", handlePromptImported);
-      };
-    }, [appId, runExternalReload]);
-
-    // 应用项目 Profile 会切换激活的 prompt（prompts 非 react-query，需主动 reload）
-    useTauriEvent("profile-applied", runExternalReload);
-
     const handleAdd = () => {
       if (reloadLockRef.current || writeLockRef.current || interactionBlocked) {
         return;
@@ -156,10 +140,6 @@ const PromptPanel = React.forwardRef<PromptPanelHandle, PromptPanelProps>(
       setEditingId(null);
       setIsFormOpen(true);
     };
-
-    React.useImperativeHandle(ref, () => ({
-      openAdd: handleAdd,
-    }));
 
     const handleEdit = (id: string) => {
       if (reloadLockRef.current || writeLockRef.current || interactionBlocked) {
@@ -231,6 +211,54 @@ const PromptPanel = React.forwardRef<PromptPanelHandle, PromptPanelProps>(
         endWrite();
       }
     };
+
+    const handleImportFromLive = async () => {
+      if (interactionBlocked || !beginWrite()) return;
+      try {
+        const refreshed = await importFromFile();
+        if (refreshed === false) {
+          externalReloadQueuedRef.current = true;
+        }
+      } catch (error) {
+        // Error handled by hook
+      } finally {
+        endWrite();
+      }
+    };
+
+    const handleSyncToLive = () => {
+      if (interactionBlocked || reloadLockRef.current || writeLockRef.current) {
+        return;
+      }
+      overlayOpenRef.current = true;
+      setConfirmDialog({
+        isOpen: true,
+        titleKey: "prompts.confirm.syncTitle",
+        messageKey: "prompts.confirm.syncMessage",
+        messageParams: { filename: PROMPT_LIVE_FILENAMES[appId] },
+        onConfirm: async () => {
+          if (!beginWrite()) return;
+          try {
+            const refreshed = await syncPromptToLive();
+            if (refreshed === false) {
+              externalReloadQueuedRef.current = true;
+            }
+            overlayOpenRef.current = false;
+            setConfirmDialog(null);
+          } catch (error) {
+            // Error handled by hook
+          } finally {
+            endWrite();
+          }
+        },
+      });
+    };
+
+    React.useImperativeHandle(ref, () => ({
+      openAdd: handleAdd,
+      importFromLive: () => void handleImportFromLive(),
+      syncToLive: handleSyncToLive,
+    }));
 
     const handleCloseForm = () => {
       if (writeLockRef.current) return;

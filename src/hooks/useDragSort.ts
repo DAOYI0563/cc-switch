@@ -11,19 +11,16 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import type { Provider } from "@/types";
-import { providersApi, type AppId } from "@/lib/api";
+import { providersApi, type ManagedAppId } from "@/lib/api";
 
-export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
+export function useDragSort(
+  providers: Record<string, Provider>,
+  appId: ManagedAppId,
+) {
   const queryClient = useQueryClient();
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
 
   const sortedProviders = useMemo(() => {
-    const locale =
-      i18n.language === "zh"
-        ? "zh-CN"
-        : i18n.language === "zh-TW"
-          ? "zh-TW"
-          : "en-US";
     return Object.values(providers).sort((a, b) => {
       if (a.sortIndex !== undefined && b.sortIndex !== undefined) {
         return a.sortIndex - b.sortIndex;
@@ -37,9 +34,9 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
         return timeA - timeB;
       }
 
-      return a.name.localeCompare(b.name, locale);
+      return a.name.localeCompare(b.name, "zh-CN");
     });
-  }, [providers, i18n.language]);
+  }, [providers]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -78,11 +75,6 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
         await providersApi.updateSortOrder(updates, appId);
         await queryClient.invalidateQueries({
           queryKey: ["providers", appId],
-        });
-
-        // 刷新故障转移队列（因为队列顺序依赖 sort_index）
-        await queryClient.invalidateQueries({
-          queryKey: ["failoverQueue", appId],
         });
 
         // 更新托盘菜单以反映新的排序（失败不影响主操作）
