@@ -20,10 +20,10 @@ pub use conflict_center::{
 };
 pub use daily_brief::DailyBriefRuntimeState;
 pub use local_scan::{
-    reconciliation_snapshot_from_parsed, record_local_writes, record_runtime_local_writes,
-    LocalScanCadence, LocalScanCoordinator, LocalScanExecutor, LocalScanParsedChange,
-    LocalScanRuntimeState, LocalScanScheduler, LocalScanSchedulerError, LocalScanWorker,
-    LocalScanWriteRegistration, LocalScanWriteTracker,
+    reconciliation_snapshot_from_parsed, record_database_local_writes, record_local_writes,
+    record_runtime_local_writes, LocalScanCadence, LocalScanCoordinator, LocalScanExecutor,
+    LocalScanParsedChange, LocalScanRuntimeState, LocalScanScheduler, LocalScanSchedulerError,
+    LocalScanWorker, LocalScanWriteRegistration, LocalScanWriteTracker,
 };
 pub use local_skill::LocalSkillService;
 pub use mcp::McpService;

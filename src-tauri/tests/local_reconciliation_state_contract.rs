@@ -9,8 +9,8 @@ use wsl_code_switch_lib::domain::{
 };
 use wsl_code_switch_lib::ports::{LocalReconciliationBaselinePort, LocalReconciliationStatePort};
 use wsl_code_switch_lib::{
-    AppState, Database, InMemoryLocalReconciliationBaselines, McpApps, McpServer, Provider,
-    ProviderMeta,
+    reconciliation_snapshot_from_parsed, AppState, Database, InMemoryLocalReconciliationBaselines,
+    McpApps, McpServer, Provider, ProviderMeta,
 };
 
 struct TestHomeGuard(Option<std::ffi::OsString>);
@@ -184,11 +184,82 @@ fn database_projection_covers_all_twelve_targets_and_keeps_baselines_independent
                     state.baseline.unwrap().records,
                     vec![LocalReconciliationRecord::new("fixture-mcp", "b".repeat(64)).unwrap()]
                 );
+            } else if domain == LocalScanDomain::Skill {
+                let baseline = state
+                    .baseline
+                    .expect("confirmed Skill metadata establishes a persisted baseline");
+                assert_eq!(baseline, state.local);
+                assert_ne!(baseline.records[0].content_digest, "a".repeat(64));
             } else {
                 assert!(state.baseline.is_none());
             }
         }
     }
+}
+
+#[test]
+fn confirmed_skill_baseline_survives_new_adapters_and_uses_canonical_record_digests() {
+    let database = Arc::new(Database::memory().unwrap());
+    database
+        .save_core_skills(&[
+            LocalSkill {
+                id: "confirmed".to_string(),
+                name: "Confirmed".to_string(),
+                description: Some("persisted".to_string()),
+                directory: "confirmed".to_string(),
+                content_hash: Some("a".repeat(64)),
+                total_size_bytes: 42,
+                file_count: 2,
+                apps: ManagedClientApps::only(ManagedClientId::Claude),
+                cloud_eligible: true,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            LocalSkill {
+                id: "unconfirmed".to_string(),
+                name: "Unconfirmed".to_string(),
+                description: None,
+                directory: "unconfirmed".to_string(),
+                content_hash: None,
+                total_size_bytes: 0,
+                file_count: 0,
+                apps: ManagedClientApps::only(ManagedClientId::Claude),
+                cloud_eligible: false,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+        ])
+        .unwrap();
+    let scan_target = target(LocalScanDomain::Skill, ManagedClientId::Claude);
+
+    let first = DatabaseLocalReconciliationStateAdapter::new(
+        database.clone(),
+        Arc::new(InMemoryLocalReconciliationBaselines::default()),
+    );
+    let expected =
+        reconciliation_snapshot_from_parsed(&first.read_parsed_local(scan_target).unwrap())
+            .unwrap();
+    let first_state = first.read_reconciliation_state(scan_target).unwrap();
+    assert_eq!(first_state.local, expected);
+    assert_eq!(first_state.baseline.as_ref().unwrap().records.len(), 1);
+    assert_eq!(
+        first_state.baseline.as_ref().unwrap().records[0].record_id,
+        "confirmed"
+    );
+    assert_ne!(
+        first_state.baseline.as_ref().unwrap().records[0].content_digest,
+        "a".repeat(64),
+        "reconciliation must digest the normalized record, not reuse the tree hash"
+    );
+
+    let overlay = Arc::new(InMemoryLocalReconciliationBaselines::default());
+    overlay
+        .confirm_record(scan_target, "confirmed", Some(&"b".repeat(64)))
+        .unwrap();
+    let restarted = DatabaseLocalReconciliationStateAdapter::new(database, overlay)
+        .read_reconciliation_state(scan_target)
+        .unwrap();
+    assert_eq!(restarted, first_state);
 }
 
 #[test]

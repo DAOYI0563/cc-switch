@@ -48,6 +48,8 @@ impl Drop for TestHomeGuard {
 struct MemoryRollbacks {
     points: Mutex<HashMap<String, RollbackPointMetadata>>,
     deleted: Mutex<usize>,
+    retained: Mutex<usize>,
+    fail_delete: bool,
 }
 
 impl TemporaryRollbackStore for MemoryRollbacks {
@@ -81,21 +83,32 @@ impl TemporaryRollbackStore for MemoryRollbacks {
     }
 
     fn delete_after_success(&self, id: &str) -> Result<(), TemporaryRollbackError> {
+        *self.deleted.lock().unwrap() += 1;
+        if self.fail_delete {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::Io,
+                "injected runtime rollback delete failure",
+            ));
+        }
         self.points
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(not_found)?;
-        *self.deleted.lock().unwrap() += 1;
         Ok(())
     }
 
     fn retain_after_failure(
         &self,
-        _id: &str,
-        _failed_at_ms: i64,
+        id: &str,
+        failed_at_ms: i64,
     ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
-        Err(not_found())
+        let mut points = self.points.lock().unwrap();
+        let point = points.get_mut(id).ok_or_else(not_found)?;
+        point.state = RollbackPointState::Failed;
+        point.failed_at_ms = Some(failed_at_ms);
+        *self.retained.lock().unwrap() += 1;
+        Ok(point.clone())
     }
 
     fn list(&self) -> Result<Vec<RollbackPointMetadata>, TemporaryRollbackError> {
@@ -362,8 +375,73 @@ fn keeping_missing_local_opencode_provider_removes_only_the_external_live_record
 
 #[test]
 #[serial]
+fn keeping_missing_local_skill_removes_only_the_external_target_copy() {
+    let (temp, _guard, state) = setup();
+    let generation_before = state.local_scan_writes.last_generation();
+    let pending_before = state.local_scan_writes.pending_count();
+    write_skill(
+        temp.path(),
+        ManagedClientId::Claude,
+        "external-skill",
+        "confirmed body",
+    );
+    LocalSkillService::import_from_live(
+        &state,
+        vec![LocalSkillImport {
+            directory: "external-skill".to_string(),
+            source_client: ManagedClientId::Claude,
+            apps: ManagedClientApps::only(ManagedClientId::Claude),
+        }],
+    )
+    .unwrap();
+    let skill_target = target_for(LocalScanDomain::Skill, ManagedClientId::Codex);
+    let (coordinator, baselines) = runtime(&state);
+    coordinator.rescan_target(skill_target);
+    write_skill(
+        temp.path(),
+        ManagedClientId::Codex,
+        "external-skill",
+        "third-party copy",
+    );
+    coordinator.rescan_target(skill_target);
+    let (source, resolver) = source_and_resolver(&state, coordinator, baselines);
+    let item = list_conflict_center_items(&[&source], &resolver)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.record_id.as_deref() == Some("external-skill"))
+        .unwrap();
+    let rollbacks = MemoryRollbacks::default();
+
+    resolve_conflict_center_item(
+        &[&source],
+        &resolver,
+        &rollbacks,
+        35,
+        &ConflictResolutionRequest {
+            item_id: item.item_id,
+            action: ConflictResolutionAction::KeepLocal,
+        },
+    )
+    .unwrap();
+
+    assert!(!skill_dir(temp.path(), ManagedClientId::Codex, "external-skill").exists());
+    assert!(skill_dir(temp.path(), ManagedClientId::Claude, "external-skill").exists());
+    assert!(list_conflict_center_items(&[&source], &resolver)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        state.local_scan_writes.last_generation(),
+        generation_before + 2
+    );
+    assert_eq!(state.local_scan_writes.pending_count(), pending_before + 1);
+}
+
+#[test]
+#[serial]
 fn keeping_local_skill_restores_the_confirmed_tree_from_another_enabled_client() {
     let (temp, _guard, state) = setup();
+    let generation_before = state.local_scan_writes.last_generation();
+    let pending_before = state.local_scan_writes.pending_count();
     write_skill(
         temp.path(),
         ManagedClientId::Claude,
@@ -427,6 +505,15 @@ fn keeping_local_skill_restores_the_confirmed_tree_from_another_enabled_client()
     assert!(list_conflict_center_items(&[&source], &resolver)
         .unwrap()
         .is_empty());
+    assert_eq!(
+        state.local_scan_writes.last_generation(),
+        generation_before + 3
+    );
+    assert_eq!(
+        state.local_scan_writes.pending_count(),
+        pending_before + 1,
+        "the KeepLocal target expectation is consumed; only the untouched Codex import expectation remains"
+    );
 }
 
 #[test]
@@ -498,15 +585,19 @@ fn one_database_projection_failure_does_not_hide_another_targets_pending_item() 
 
 #[test]
 #[serial]
-fn keeping_local_mcp_rewrites_only_target_live_and_clears_the_pending_item() {
+fn keeping_local_mcp_survives_rollback_cleanup_failure_after_self_write_registration() {
     let (_temp, _guard, state) = setup();
+    let generation_before = state.local_scan_writes.last_generation();
     let (coordinator, baselines) = runtime(&state);
     coordinator.rescan_target(target());
     write_external_change();
     coordinator.rescan_target(target());
     let (source, resolver) = source_and_resolver(&state, coordinator, baselines);
     let listed = list_conflict_center_items(&[&source], &resolver).unwrap();
-    let rollbacks = MemoryRollbacks::default();
+    let rollbacks = MemoryRollbacks {
+        fail_delete: true,
+        ..Default::default()
+    };
 
     resolve_conflict_center_item(
         &[&source],
@@ -531,7 +622,15 @@ fn keeping_local_mcp_rewrites_only_target_live_and_clears_the_pending_item() {
     assert!(list_conflict_center_items(&[&source], &resolver)
         .unwrap()
         .is_empty());
+    assert_eq!(
+        state.local_scan_writes.last_generation(),
+        generation_before + 1
+    );
     assert_eq!(*rollbacks.deleted.lock().unwrap(), 1);
+    assert_eq!(*rollbacks.retained.lock().unwrap(), 1);
+    let points = rollbacks.points.lock().unwrap();
+    assert_eq!(points["runtime-point"].state, RollbackPointState::Failed);
+    assert_eq!(points["runtime-point"].failed_at_ms, Some(20));
 }
 
 #[test]

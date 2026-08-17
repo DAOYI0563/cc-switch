@@ -2,15 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use unicode_casefold::UnicodeCaseFold;
 
 use crate::adapters::local_skill_tree::LocalSkillTreeAdapter;
+use crate::adapters::temporary_rollback::FixedTemporaryRollbackStore;
 use crate::domain::{
-    LocalScanDomain, LocalScanTarget, LocalSkill, LocalSkillImport, ManagedClientId,
-    UnmanagedLocalSkill, UnmanagedSkillCopy,
+    LocalScanDomain, LocalScanTarget, LocalSkill, LocalSkillImport, LocalSkillScanIssue,
+    LocalSkillScanIssueKind, LocalSkillScanResult, ManagedClientApps, ManagedClientId,
+    RollbackPointPurpose, UnmanagedLocalSkill,
 };
 use crate::error::AppError;
 use crate::ports::{
-    LocalSkillRepository, LocalSkillTree, LocalSkillTreePort, LocalSkillTreeSnapshot,
+    LocalSkillRepository, LocalSkillTree, LocalSkillTreeError, LocalSkillTreeErrorCode,
+    LocalSkillTreePort, LocalSkillTreeSnapshot, TemporaryRollbackError, TemporaryRollbackStore,
     WslPathResolver,
 };
 use crate::store::AppState;
@@ -26,6 +30,22 @@ struct SkillFrontMatter {
 #[derive(Debug)]
 struct PreparedImport {
     record: LocalSkill,
+}
+
+#[derive(Debug)]
+struct PreparedLocalSkillScan {
+    before: Vec<LocalSkill>,
+    unmanaged: Vec<UnmanagedLocalSkill>,
+    issues: Vec<LocalSkillScanIssue>,
+    upserts: Vec<LocalSkill>,
+    removed_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillIndexRollbackPayload<'a> {
+    schema_version: u32,
+    skills: &'a [LocalSkill],
 }
 
 /// Read-only SKILL.md preview payload for the skill detail dialog.
@@ -118,9 +138,16 @@ impl LocalSkillService {
         Ok(path.to_string_lossy().to_string())
     }
 
-    pub fn scan_unmanaged(state: &AppState) -> Result<Vec<UnmanagedLocalSkill>, AppError> {
+    pub fn scan_unmanaged(state: &AppState) -> Result<LocalSkillScanResult, AppError> {
+        let _guard = mutation_lock().lock()?;
         let adapter = LocalSkillTreeAdapter::runtime();
-        Self::scan_unmanaged_with(state.db.as_ref(), &adapter)
+        let rollbacks = FixedTemporaryRollbackStore::runtime();
+        Self::scan_unmanaged_with_rollback(
+            state.db.as_ref(),
+            &adapter,
+            &rollbacks,
+            chrono::Utc::now().timestamp_millis(),
+        )
     }
 
     pub fn import_from_live(
@@ -129,14 +156,11 @@ impl LocalSkillService {
     ) -> Result<Vec<LocalSkill>, AppError> {
         let _guard = mutation_lock().lock()?;
         let adapter = LocalSkillTreeAdapter::runtime();
+        // The selected source enters managed scope even though import does not
+        // rewrite its tree, so every enabled client needs a DB-aware expectation.
         let written_clients: Vec<_> = imports
             .iter()
-            .flat_map(|import| {
-                import
-                    .apps
-                    .enabled_clients()
-                    .filter(move |client| *client != import.source_client)
-            })
+            .flat_map(|import| import.apps.enabled_clients())
             .collect();
         let records = Self::import_with(
             state.db.as_ref(),
@@ -162,13 +186,7 @@ impl LocalSkillService {
             source_client,
             chrono::Utc::now().timestamp_millis(),
         )?;
-        record_skill_writes(
-            state,
-            skill
-                .apps
-                .enabled_clients()
-                .filter(|client| *client != source_client),
-        );
+        record_skill_writes(state, skill.apps.enabled_clients());
         Ok(skill)
     }
 
@@ -216,82 +234,342 @@ impl LocalSkillService {
         Ok(removed)
     }
 
+    #[cfg(test)]
     fn scan_unmanaged_with<R: LocalSkillRepository, T: LocalSkillTreePort>(
         repository: &R,
         trees: &T,
-    ) -> Result<Vec<UnmanagedLocalSkill>, AppError> {
-        let managed: HashSet<_> = repository
-            .list_local_skills()
-            .map_err(repository_error)?
-            .into_iter()
-            .map(|skill| skill.directory.to_lowercase())
-            .collect();
-        let mut found: HashMap<String, (UnmanagedLocalSkill, HashMap<ManagedClientId, String>)> =
-            HashMap::new();
+    ) -> Result<LocalSkillScanResult, AppError> {
+        let prepared =
+            Self::prepare_scan(repository, trees, chrono::Utc::now().timestamp_millis())?;
+        Self::apply_prepared_scan(repository, &prepared)
+    }
+
+    fn scan_unmanaged_with_rollback<
+        R: LocalSkillRepository,
+        T: LocalSkillTreePort,
+        B: TemporaryRollbackStore,
+    >(
+        repository: &R,
+        trees: &T,
+        rollbacks: &B,
+        now_ms: i64,
+    ) -> Result<LocalSkillScanResult, AppError> {
+        let prepared = Self::prepare_scan(repository, trees, now_ms)?;
+        if prepared.upserts.is_empty() && prepared.removed_ids.is_empty() {
+            return Self::apply_prepared_scan(repository, &prepared);
+        }
+        let payload = serde_json::to_vec(&SkillIndexRollbackPayload {
+            schema_version: 1,
+            skills: &prepared.before,
+        })
+        .map_err(|error| AppError::JsonSerialize { source: error })?;
+        let rollback = rollbacks
+            .create(RollbackPointPurpose::SkillIndexRefresh, now_ms, &payload)
+            .map_err(rollback_error)?;
+        match Self::apply_prepared_scan(repository, &prepared) {
+            Ok(result) => {
+                if let Err(delete) = rollbacks.delete_after_success(&rollback.id) {
+                    log::warn!(
+                        "Skill 索引刷新已提交，但临时回滚点清理失败: kind={:?}",
+                        delete.code
+                    );
+                    if let Err(retain) = rollbacks.retain_after_failure(&rollback.id, now_ms) {
+                        log::warn!(
+                            "Skill 索引刷新已提交，但临时回滚点保留失败: kind={:?}",
+                            retain.code
+                        );
+                    }
+                }
+                Ok(result)
+            }
+            Err(primary) => match rollbacks.retain_after_failure(&rollback.id, now_ms) {
+                Ok(_) => Err(primary),
+                Err(retain) => Err(AppError::Message(format!(
+                    "{primary}; Skill 索引刷新回滚点保留也失败: {retain}"
+                ))),
+            },
+        }
+    }
+
+    fn prepare_scan<R: LocalSkillRepository, T: LocalSkillTreePort>(
+        repository: &R,
+        trees: &T,
+        now_ms: i64,
+    ) -> Result<PreparedLocalSkillScan, AppError> {
+        let before = repository.list_local_skills().map_err(repository_error)?;
+        let mut listed = HashMap::new();
         for client in ManagedClientId::ALL {
-            for candidate in trees.scan(client).map_err(tree_error)? {
-                let key = candidate.directory.to_lowercase();
-                if managed.contains(&key) {
+            // Every fixed root is listed before any capture or database write so
+            // an inaccessible home/root can never be mistaken for mass removal.
+            listed.insert(client, trees.list_directories(client).map_err(tree_error)?);
+        }
+
+        let mut managed_spellings: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut managed_counts: HashMap<String, usize> = HashMap::new();
+        for skill in &before {
+            let key = skill_directory_identity(&skill.directory);
+            managed_spellings
+                .entry(key.clone())
+                .or_default()
+                .insert(skill.directory.clone());
+            *managed_counts.entry(key).or_default() += 1;
+        }
+        let managed_keys: HashSet<_> = managed_counts.keys().cloned().collect();
+        let mut live_spellings: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut case_clients: HashMap<String, Vec<ManagedClientId>> = HashMap::new();
+        for client in ManagedClientId::ALL {
+            for candidate in &listed[&client] {
+                let key = skill_directory_identity(&candidate.directory);
+                live_spellings
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(candidate.directory.clone());
+                let clients = case_clients.entry(key).or_default();
+                if !clients.contains(&client) {
+                    clients.push(client);
+                }
+            }
+        }
+        let mut case_collisions: HashSet<_> = live_spellings
+            .iter()
+            .filter(|(_, spellings)| spellings.len() > 1)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (key, count) in &managed_counts {
+            let database_collision = *count > 1;
+            let live_mismatch = live_spellings.get(key).is_some_and(|live| {
+                managed_spellings
+                    .get(key)
+                    .is_none_or(|managed| live.iter().any(|spelling| !managed.contains(spelling)))
+            });
+            if database_collision || live_mismatch {
+                case_collisions.insert(key.clone());
+            }
+        }
+
+        let mut upserts = Vec::new();
+        let mut removed_ids = Vec::new();
+        let mut issues = Vec::new();
+        for original in &before {
+            let case_key = skill_directory_identity(&original.directory);
+            if case_collisions.contains(&case_key) {
+                issues.push(LocalSkillScanIssue {
+                    directory: original.directory.clone(),
+                    clients: case_clients.get(&case_key).cloned().unwrap_or_default(),
+                    kind: LocalSkillScanIssueKind::CaseCollision,
+                });
+                continue;
+            }
+
+            let mut copies = Vec::new();
+            let mut invalid_clients = Vec::new();
+            for client in ManagedClientId::ALL {
+                let exact: Vec<_> = listed[&client]
+                    .iter()
+                    .filter(|candidate| candidate.directory == original.directory)
+                    .collect();
+                if exact.len() > 1 {
+                    invalid_clients.push(client);
                     continue;
                 }
+                let Some(_) = exact.first() else {
+                    continue;
+                };
+                match trees.capture(client, &original.directory) {
+                    Ok(snapshot) => match snapshot.tree {
+                        Some(tree) if parse_metadata(&tree, &original.directory).is_ok() => {
+                            copies.push((client, tree));
+                        }
+                        Some(_) | None => invalid_clients.push(client),
+                    },
+                    Err(error) => {
+                        log::warn!(
+                            "无法安全刷新 {} Skill {}: kind={:?}",
+                            client,
+                            original.directory,
+                            error.code
+                        );
+                        invalid_clients.push(client);
+                    }
+                }
+            }
+            if !invalid_clients.is_empty() {
+                issues.push(LocalSkillScanIssue {
+                    directory: original.directory.clone(),
+                    clients: invalid_clients,
+                    kind: LocalSkillScanIssueKind::InvalidCopy,
+                });
+                continue;
+            }
+            if copies.is_empty() {
+                removed_ids.push(original.id.clone());
+                continue;
+            }
+
+            let mut actual_apps = ManagedClientApps::default();
+            for (client, _) in &copies {
+                actual_apps.set_enabled_for(*client, true);
+            }
+            let canonical = &copies[0].1;
+            // 已以“分歧接受”导入的 Skill（content_hash 为 None）不再把跨客户端
+            // 内容差异当作错误：差异是各端配置不同导致的合法状态。
+            let diverged = original.content_hash.is_none();
+            if !diverged
+                && copies
+                    .iter()
+                    .any(|(_, tree)| tree.content_hash != canonical.content_hash)
+            {
+                let mut refreshed = original.clone();
+                refreshed.apps = actual_apps;
+                if refreshed.apps != original.apps {
+                    refreshed.updated_at_ms = now_ms.max(original.updated_at_ms);
+                    upserts.push(refreshed);
+                }
+                issues.push(LocalSkillScanIssue {
+                    directory: original.directory.clone(),
+                    clients: copies.iter().map(|(client, _)| *client).collect(),
+                    kind: LocalSkillScanIssueKind::DivergentCopies,
+                });
+                continue;
+            }
+
+            let (name, description) = parse_metadata(canonical, &original.directory)?;
+            let mut refreshed = original.clone();
+            refreshed.name = name;
+            refreshed.description = description;
+            refreshed.content_hash = if diverged {
+                None
+            } else {
+                Some(canonical.content_hash.clone())
+            };
+            refreshed.total_size_bytes = canonical.total_size_bytes;
+            refreshed.file_count = canonical.file_count;
+            refreshed.apps = actual_apps;
+            refreshed.cloud_eligible = if diverged {
+                false
+            } else {
+                canonical.is_cloud_eligible()
+            };
+            if refreshed != *original {
+                refreshed.updated_at_ms = now_ms.max(original.updated_at_ms);
+                upserts.push(refreshed);
+            }
+        }
+
+        let mut unmanaged_collision_keys: Vec<_> = case_collisions
+            .iter()
+            .filter(|key| !managed_keys.contains(*key))
+            .cloned()
+            .collect();
+        unmanaged_collision_keys.sort();
+        for key in unmanaged_collision_keys {
+            let directory = live_spellings[&key]
+                .iter()
+                .min()
+                .cloned()
+                .unwrap_or(key.clone());
+            issues.push(LocalSkillScanIssue {
+                directory,
+                clients: case_clients.get(&key).cloned().unwrap_or_default(),
+                kind: LocalSkillScanIssueKind::CaseCollision,
+            });
+        }
+
+        let mut unmanaged: HashMap<String, UnmanagedLocalSkill> = HashMap::new();
+        for client in ManagedClientId::ALL {
+            for candidate in &listed[&client] {
+                let key = skill_directory_identity(&candidate.directory);
+                if managed_keys.contains(&key) || case_collisions.contains(&key) {
+                    continue;
+                }
+                let contents = match trees.read_manifest(candidate) {
+                    Ok(Some(contents)) => contents,
+                    Ok(None) => continue,
+                    Err(error)
+                        if matches!(
+                            error.code,
+                            LocalSkillTreeErrorCode::InvalidPath
+                                | LocalSkillTreeErrorCode::LinkNotAllowed
+                                | LocalSkillTreeErrorCode::InvalidTree
+                        ) =>
+                    {
+                        log::warn!(
+                            "跳过 manifest 无法安全读取的 {} Skill {}: kind={:?}",
+                            client,
+                            candidate.directory,
+                            error.code
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(tree_error(error)),
+                };
                 let (name, description) =
-                    match parse_metadata(&candidate.tree, &candidate.directory) {
+                    match parse_manifest_metadata(&contents, &candidate.directory) {
                         Ok(metadata) => metadata,
-                        Err(error) => {
-                            log::warn!(
-                                "跳过元数据无效的 {} Skill {}: {}",
-                                client,
-                                candidate.directory,
-                                error
-                            );
+                        Err(_) => {
+                            log::warn!("跳过元数据无效的 {} Skill {}", client, candidate.directory);
                             continue;
                         }
                     };
-                let (skill, hashes) = found.entry(key).or_insert_with(|| {
-                    (
-                        UnmanagedLocalSkill {
-                            directory: candidate.directory.clone(),
-                            name: name.clone(),
-                            description: description.clone(),
-                            found_in: Vec::new(),
-                            copies: Vec::new(),
-                            path: candidate.path.clone(),
-                        },
-                        HashMap::new(),
-                    )
+                let skill = unmanaged.entry(key).or_insert_with(|| UnmanagedLocalSkill {
+                    directory: candidate.directory.clone(),
+                    name,
+                    description,
+                    found_in: Vec::new(),
                 });
                 if !skill.found_in.contains(&client) {
                     skill.found_in.push(client);
                 }
-                hashes.insert(client, candidate.tree.content_hash.clone());
             }
         }
-        let mut result: Vec<_> = found
-            .into_values()
-            .map(|(mut skill, hashes)| {
-                skill.found_in.sort_by_key(|client| match client {
-                    ManagedClientId::Claude => 0,
-                    ManagedClientId::Codex => 1,
-                    ManagedClientId::Opencode => 2,
-                });
-                skill.copies = skill
-                    .found_in
-                    .iter()
-                    .map(|client| UnmanagedSkillCopy {
-                        client: *client,
-                        content_hash: hashes.get(client).cloned().unwrap_or_default(),
-                    })
-                    .collect();
-                skill
-            })
-            .collect();
-        result.sort_by(|left, right| {
+        let mut unmanaged: Vec<_> = unmanaged.into_values().collect();
+        unmanaged.sort_by(|left, right| {
             left.name
                 .to_lowercase()
                 .cmp(&right.name.to_lowercase())
                 .then_with(|| left.directory.cmp(&right.directory))
         });
-        Ok(result)
+        issues.sort_by(|left, right| {
+            left.directory
+                .to_lowercase()
+                .cmp(&right.directory.to_lowercase())
+                .then_with(|| left.directory.cmp(&right.directory))
+        });
+        Ok(PreparedLocalSkillScan {
+            before,
+            unmanaged,
+            issues,
+            upserts,
+            removed_ids,
+        })
+    }
+
+    fn apply_prepared_scan<R: LocalSkillRepository>(
+        repository: &R,
+        prepared: &PreparedLocalSkillScan,
+    ) -> Result<LocalSkillScanResult, AppError> {
+        let updated_count = prepared.upserts.len() as u64;
+        let removed_count = prepared.removed_ids.len() as u64;
+        let mut installed = if updated_count == 0 && removed_count == 0 {
+            prepared.before.clone()
+        } else {
+            repository
+                .reconcile_local_skills(&prepared.upserts, &prepared.removed_ids)
+                .map_err(repository_error)?
+        };
+        installed.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(LocalSkillScanResult {
+            installed,
+            unmanaged: prepared.unmanaged.clone(),
+            issues: prepared.issues.clone(),
+            updated_count,
+            removed_count,
+        })
     }
 
     fn import_with<R: LocalSkillRepository, T: LocalSkillTreePort>(
@@ -308,7 +586,7 @@ impl LocalSkillService {
             import
                 .validate()
                 .map_err(|error| AppError::InvalidInput(error.to_string()))?;
-            if !requested_directories.insert(import.directory.to_lowercase()) {
+            if !requested_directories.insert(skill_directory_identity(&import.directory)) {
                 return Err(AppError::InvalidInput(format!(
                     "同一批导入中重复选择了 Skill 目录: {}",
                     import.directory
@@ -317,10 +595,10 @@ impl LocalSkillService {
         }
         let managed = repository.list_local_skills().map_err(repository_error)?;
         for import in &imports {
-            if managed
-                .iter()
-                .any(|skill| skill.directory.eq_ignore_ascii_case(&import.directory))
-            {
+            if managed.iter().any(|skill| {
+                skill_directory_identity(&skill.directory)
+                    == skill_directory_identity(&import.directory)
+            }) {
                 return Err(AppError::InvalidInput(format!(
                     "Skill 已由本地核心管理: {}",
                     import.directory
@@ -342,23 +620,7 @@ impl LocalSkillService {
                 ))
             })?;
             let (name, description) = parse_metadata(&tree, &import.directory)?;
-            let record = LocalSkill {
-                id: format!("local-{}", uuid::Uuid::new_v4().simple()),
-                name,
-                description,
-                directory: import.directory.clone(),
-                content_hash: Some(tree.content_hash.clone()),
-                total_size_bytes: tree.total_size_bytes,
-                file_count: tree.file_count,
-                apps: import.apps.clone(),
-                cloud_eligible: tree.is_cloud_eligible(),
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-            record
-                .validate()
-                .map_err(|error| AppError::InvalidInput(error.to_string()))?;
-
+            let mut diverged = false;
             for target in import.apps.enabled_clients() {
                 if target == import.source_client {
                     continue;
@@ -366,22 +628,39 @@ impl LocalSkillService {
                 let snapshot = trees
                     .capture(target, &import.directory)
                     .map_err(tree_error)?;
-                if snapshot
-                    .tree
-                    .as_ref()
-                    .is_some_and(|target_tree| target_tree.content_hash != tree.content_hash)
-                {
-                    return Err(import_target_conflict_error(
-                        &import.directory,
-                        import.source_client,
-                        target,
-                    ));
-                }
-                if snapshot.tree.is_none() {
+                if let Some(target_tree) = &snapshot.tree {
+                    if target_tree.content_hash != tree.content_hash {
+                        // 同名副本的内容按客户端而异（例如各端的细微配置差异），
+                        // 视为同一 Skill 的合法差异：原样接管，不覆盖也不报错。
+                        diverged = true;
+                    }
+                    // 已存在的副本（一致或不一致）均原样接管，不写入。
+                } else {
+                    // 目标端尚无副本：将来源树写入该客户端。
                     writes.push((target, import.directory.clone(), tree.clone()));
                     snapshots.push(snapshot);
                 }
             }
+            let record = LocalSkill {
+                id: format!("local-{}", uuid::Uuid::new_v4().simple()),
+                name,
+                description,
+                directory: import.directory.clone(),
+                content_hash: if diverged {
+                    None
+                } else {
+                    Some(tree.content_hash.clone())
+                },
+                total_size_bytes: tree.total_size_bytes,
+                file_count: tree.file_count,
+                apps: import.apps.clone(),
+                cloud_eligible: !diverged && tree.is_cloud_eligible(),
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            };
+            record
+                .validate()
+                .map_err(|error| AppError::InvalidInput(error.to_string()))?;
             prepared.push(PreparedImport { record });
         }
 
@@ -448,7 +727,9 @@ impl LocalSkillService {
                     .content_hash
                     .as_ref()
                     .is_some_and(|baseline| target_tree.content_hash == *baseline);
-                if !target_is_source && !target_is_baseline {
+                // 分歧接受的 Skill 各端内容本就可能不同，手动同步时直接以
+                // 所选来源覆盖各端，不再以此报错。
+                if !target_is_source && !target_is_baseline && skill.content_hash.is_some() {
                     return Err(external_change_error(&skill.directory, target));
                 }
                 if target_is_source {
@@ -494,23 +775,22 @@ impl LocalSkillService {
         let Some(skill) = repository.get_local_skill(id).map_err(repository_error)? else {
             return Ok(false);
         };
-        let baseline = skill.content_hash.as_ref().ok_or_else(|| {
-            AppError::InvalidInput(format!(
-                "Skill {} 尚无内容基线，请先从一个 live 客户端手动同步",
-                skill.directory
-            ))
-        })?;
+        // 分歧接受的 Skill（content_hash 为 None）各端内容本就可能不同，
+        // 删除时不再以单一基线校验每个副本，直接删除受管目录。
+        let baseline = skill.content_hash.as_ref();
         let mut snapshots = Vec::new();
         for client in skill.apps.enabled_clients() {
             let snapshot = trees
                 .capture(client, &skill.directory)
                 .map_err(tree_error)?;
-            if snapshot
-                .tree
-                .as_ref()
-                .is_some_and(|tree| tree.content_hash != *baseline)
-            {
-                return Err(external_change_error(&skill.directory, client));
+            if let Some(baseline) = baseline {
+                if snapshot
+                    .tree
+                    .as_ref()
+                    .is_some_and(|tree| tree.content_hash != *baseline)
+                {
+                    return Err(external_change_error(&skill.directory, client));
+                }
             }
             snapshots.push(snapshot);
         }
@@ -587,10 +867,12 @@ impl LocalSkillService {
                     skill.directory
                 )));
             }
-            if snapshot
-                .tree
-                .as_ref()
-                .is_some_and(|target| target.content_hash != tree.content_hash)
+            // 分歧接受的 Skill 各端内容本就可能不同，启用时不以此阻断。
+            if skill.content_hash.is_some()
+                && snapshot
+                    .tree
+                    .as_ref()
+                    .is_some_and(|target| target.content_hash != tree.content_hash)
             {
                 return Err(external_change_error(&skill.directory, target_client));
             }
@@ -607,13 +889,15 @@ impl LocalSkillService {
                     "不能禁用 Skill 的最后一个 live 副本".to_string(),
                 ));
             }
-            if snapshot.tree.as_ref().is_some_and(|target| {
-                skill
-                    .content_hash
+            // 分歧接受的 Skill 各端内容本就可能不同，禁用时不以此阻断。
+            if let Some(baseline) = skill.content_hash.as_ref() {
+                if snapshot
+                    .tree
                     .as_ref()
-                    .is_none_or(|baseline| target.content_hash != *baseline)
-            }) {
-                return Err(external_change_error(&skill.directory, target_client));
+                    .is_some_and(|target| target.content_hash != *baseline)
+                {
+                    return Err(external_change_error(&skill.directory, target_client));
+                }
             }
             trees
                 .remove(target_client, &skill.directory)
@@ -637,13 +921,18 @@ impl LocalSkillService {
 }
 
 fn record_skill_writes(state: &AppState, clients: impl IntoIterator<Item = ManagedClientId>) {
-    crate::services::record_runtime_local_writes(
+    crate::services::record_database_local_writes(
         &state.local_scan_writes,
+        state.db.clone(),
         clients.into_iter().map(|client_id| LocalScanTarget {
             domain: LocalScanDomain::Skill,
             client_id,
         }),
     );
+}
+
+fn skill_directory_identity(directory: &str) -> String {
+    directory.case_fold().collect()
 }
 
 fn parse_metadata(
@@ -653,6 +942,13 @@ fn parse_metadata(
     let contents = tree
         .file("SKILL.md")
         .ok_or_else(|| AppError::InvalidInput("Skill 目录缺少 SKILL.md".to_string()))?;
+    parse_manifest_metadata(contents, fallback_name)
+}
+
+fn parse_manifest_metadata(
+    contents: &[u8],
+    fallback_name: &str,
+) -> Result<(String, Option<String>), AppError> {
     let text = std::str::from_utf8(contents)
         .map_err(|error| AppError::InvalidInput(format!("SKILL.md 不是有效 UTF-8: {error}")))?;
     let front_matter = text
@@ -675,6 +971,21 @@ fn parse_metadata(
         .and_then(|metadata| metadata.description)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    LocalSkill {
+        id: "local-scan-metadata".to_string(),
+        name: name.clone(),
+        description: description.clone(),
+        directory: fallback_name.to_string(),
+        content_hash: None,
+        total_size_bytes: 0,
+        file_count: 0,
+        apps: ManagedClientApps::only(ManagedClientId::Claude),
+        cloud_eligible: false,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    }
+    .validate()
+    .map_err(|error| AppError::InvalidInput(format!("SKILL.md 元数据无效: {error}")))?;
     Ok((name, description))
 }
 
@@ -686,7 +997,12 @@ fn rollback_trees<T: LocalSkillTreePort>(
     let failures: Vec<_> = snapshots
         .iter()
         .rev()
-        .filter_map(|snapshot| trees.restore(snapshot).err().map(|error| error.to_string()))
+        .filter_map(|snapshot| {
+            trees
+                .restore(snapshot)
+                .err()
+                .map(|error| format!("kind={:?}", error.code))
+        })
         .collect();
     if failures.is_empty() {
         primary
@@ -705,50 +1021,38 @@ fn external_change_error(directory: &str, client: ManagedClientId) -> AppError {
     ))
 }
 
-fn import_target_conflict_error(
-    directory: &str,
-    source: ManagedClientId,
-    target: ManagedClientId,
-) -> AppError {
-    AppError::InvalidInput(format!(
-        "{} 中的 Skill {} 与所选 {} 来源内容不同；请取消选择 {}，或改选 {} 为内容来源",
-        client_display_name(target),
-        directory,
-        client_display_name(source),
-        client_display_name(target),
-        client_display_name(target),
+fn tree_error(error: LocalSkillTreeError) -> AppError {
+    AppError::Message(format!("Skill live 文件树操作失败: kind={:?}", error.code))
+}
+
+fn repository_error(_error: impl std::fmt::Display) -> AppError {
+    AppError::Database("Skill 本地核心持久化失败".to_string())
+}
+
+fn rollback_error(error: TemporaryRollbackError) -> AppError {
+    AppError::Message(format!(
+        "Skill 索引刷新临时回滚点失败: kind={:?}",
+        error.code
     ))
-}
-
-fn client_display_name(client: ManagedClientId) -> &'static str {
-    match client {
-        ManagedClientId::Claude => "Claude",
-        ManagedClientId::Codex => "Codex",
-        ManagedClientId::Opencode => "OpenCode",
-    }
-}
-
-fn tree_error(error: impl std::fmt::Display) -> AppError {
-    AppError::Message(format!("Skill live 文件树操作失败: {error}"))
-}
-
-fn repository_error(error: impl std::fmt::Display) -> AppError {
-    AppError::Database(format!("Skill 本地核心持久化失败: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{RollbackPointMetadata, RollbackPointState};
     use crate::ports::{
-        LocalSkillFile, LocalSkillLiveCandidate, LocalSkillRepositoryError, LocalSkillTreeError,
+        LocalSkillDirectoryCandidate, LocalSkillFile, LocalSkillRepositoryError,
+        LocalSkillTreeError, TemporaryRollbackError, TemporaryRollbackErrorCode,
     };
     use std::sync::Mutex;
 
     #[derive(Default)]
     struct FailingRepository {
         records: Mutex<Vec<LocalSkill>>,
+        reconcile_calls: Mutex<usize>,
         fail_save: bool,
         fail_delete: bool,
+        fail_reconcile: bool,
     }
 
     impl LocalSkillRepository for FailingRepository {
@@ -789,32 +1093,185 @@ mod tests {
             records.retain(|record| record.id != id);
             Ok(records.len() != before)
         }
+
+        fn reconcile_local_skills(
+            &self,
+            upserts: &[LocalSkill],
+            removed_ids: &[String],
+        ) -> Result<Vec<LocalSkill>, LocalSkillRepositoryError> {
+            *self.reconcile_calls.lock().unwrap() += 1;
+            if self.fail_reconcile {
+                return Err(LocalSkillRepositoryError::new("injected reconcile failure"));
+            }
+            let mut records = self.records.lock().unwrap();
+            let mut reconciled = records.clone();
+            for skill in upserts {
+                if let Some(existing) = reconciled.iter_mut().find(|item| item.id == skill.id) {
+                    *existing = skill.clone();
+                } else {
+                    reconciled.push(skill.clone());
+                }
+            }
+            reconciled.retain(|record| !removed_ids.contains(&record.id));
+            reconciled.sort_by(|left, right| {
+                left.name
+                    .to_lowercase()
+                    .cmp(&right.name.to_lowercase())
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            *records = reconciled.clone();
+            Ok(reconciled)
+        }
+    }
+
+    #[derive(Default)]
+    struct MemoryRollbacks {
+        created: Mutex<Vec<(RollbackPointPurpose, i64, Vec<u8>)>>,
+        deleted: Mutex<Vec<String>>,
+        retained: Mutex<Vec<(String, i64)>>,
+        fail_create: bool,
+        fail_delete: bool,
+    }
+
+    impl TemporaryRollbackStore for MemoryRollbacks {
+        fn create(
+            &self,
+            purpose: RollbackPointPurpose,
+            created_at_ms: i64,
+            payload: &[u8],
+        ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
+            if self.fail_create {
+                return Err(TemporaryRollbackError::new(
+                    TemporaryRollbackErrorCode::Protection,
+                    "injected rollback create failure",
+                ));
+            }
+            let mut created = self.created.lock().unwrap();
+            let id = format!("rollback-{}", created.len() + 1);
+            created.push((purpose, created_at_ms, payload.to_vec()));
+            Ok(RollbackPointMetadata {
+                schema_version: RollbackPointMetadata::SCHEMA_VERSION,
+                id,
+                purpose,
+                state: RollbackPointState::Pending,
+                created_at_ms,
+                failed_at_ms: None,
+                payload_size_bytes: payload.len() as u64,
+                payload_sha256: "a".repeat(64),
+            })
+        }
+
+        fn restore(&self, id: &str) -> Result<Vec<u8>, TemporaryRollbackError> {
+            let index = id
+                .strip_prefix("rollback-")
+                .and_then(|value| value.parse::<usize>().ok())
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(missing_rollback)?;
+            self.created
+                .lock()
+                .unwrap()
+                .get(index)
+                .map(|(_, _, payload)| payload.clone())
+                .ok_or_else(missing_rollback)
+        }
+
+        fn delete_after_success(&self, id: &str) -> Result<(), TemporaryRollbackError> {
+            self.deleted.lock().unwrap().push(id.to_string());
+            if self.fail_delete {
+                return Err(TemporaryRollbackError::new(
+                    TemporaryRollbackErrorCode::Io,
+                    "injected rollback delete failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn retain_after_failure(
+            &self,
+            id: &str,
+            failed_at_ms: i64,
+        ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
+            self.retained
+                .lock()
+                .unwrap()
+                .push((id.to_string(), failed_at_ms));
+            Ok(RollbackPointMetadata {
+                schema_version: RollbackPointMetadata::SCHEMA_VERSION,
+                id: id.to_string(),
+                purpose: RollbackPointPurpose::SkillIndexRefresh,
+                state: RollbackPointState::Failed,
+                created_at_ms: failed_at_ms,
+                failed_at_ms: Some(failed_at_ms),
+                payload_size_bytes: 0,
+                payload_sha256: "a".repeat(64),
+            })
+        }
+
+        fn list(&self) -> Result<Vec<RollbackPointMetadata>, TemporaryRollbackError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn missing_rollback() -> TemporaryRollbackError {
+        TemporaryRollbackError::new(
+            TemporaryRollbackErrorCode::NotFound,
+            "missing fixture rollback point",
+        )
     }
 
     #[derive(Default)]
     struct MemoryTrees {
         trees: Mutex<HashMap<(ManagedClientId, String), LocalSkillTree>>,
+        manifest_reads: Mutex<Vec<(ManagedClientId, String)>>,
+        capture_reads: Mutex<Vec<(ManagedClientId, String)>>,
+        fail_list: Mutex<Option<LocalSkillTreeError>>,
+        fail_manifest: Mutex<Option<LocalSkillTreeError>>,
+        fail_capture: Mutex<HashMap<(ManagedClientId, String), LocalSkillTreeError>>,
         fail_replace: Mutex<Option<(ManagedClientId, String)>>,
     }
 
     impl LocalSkillTreePort for MemoryTrees {
-        fn scan(
+        fn list_directories(
             &self,
             client: ManagedClientId,
-        ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError> {
+        ) -> Result<Vec<LocalSkillDirectoryCandidate>, LocalSkillTreeError> {
+            if let Some(error) = self.fail_list.lock().unwrap().clone() {
+                return Err(error);
+            }
+            let mut candidates: Vec<_> = self
+                .trees
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|(candidate_client, _)| *candidate_client == client)
+                .map(|(_, directory)| LocalSkillDirectoryCandidate {
+                    client,
+                    directory: directory.clone(),
+                    path: format!("/fixture/{directory}"),
+                })
+                .collect();
+            candidates.sort_by(|left, right| left.directory.cmp(&right.directory));
+            Ok(candidates)
+        }
+
+        fn read_manifest(
+            &self,
+            candidate: &LocalSkillDirectoryCandidate,
+        ) -> Result<Option<Vec<u8>>, LocalSkillTreeError> {
+            if let Some(error) = self.fail_manifest.lock().unwrap().clone() {
+                return Err(error);
+            }
+            self.manifest_reads
+                .lock()
+                .unwrap()
+                .push((candidate.client, candidate.directory.clone()));
             Ok(self
                 .trees
                 .lock()
                 .unwrap()
-                .iter()
-                .filter(|((candidate_client, _), _)| *candidate_client == client)
-                .map(|((_, directory), tree)| LocalSkillLiveCandidate {
-                    client,
-                    directory: directory.clone(),
-                    path: format!("/fixture/{directory}"),
-                    tree: tree.clone(),
-                })
-                .collect())
+                .get(&(candidate.client, candidate.directory.clone()))
+                .and_then(|tree| tree.file("SKILL.md"))
+                .map(ToOwned::to_owned))
         }
 
         fn capture(
@@ -822,6 +1279,19 @@ mod tests {
             client: ManagedClientId,
             directory: &str,
         ) -> Result<LocalSkillTreeSnapshot, LocalSkillTreeError> {
+            self.capture_reads
+                .lock()
+                .unwrap()
+                .push((client, directory.to_string()));
+            if let Some(error) = self
+                .fail_capture
+                .lock()
+                .unwrap()
+                .get(&(client, directory.to_string()))
+                .cloned()
+            {
+                return Err(error);
+            }
             Ok(LocalSkillTreeSnapshot {
                 client,
                 directory: directory.to_string(),
@@ -903,11 +1373,19 @@ mod tests {
     }
 
     fn record(content_hash: Option<String>, apps: crate::domain::ManagedClientApps) -> LocalSkill {
+        record_for("fixture", content_hash, apps)
+    }
+
+    fn record_for(
+        directory: &str,
+        content_hash: Option<String>,
+        apps: crate::domain::ManagedClientApps,
+    ) -> LocalSkill {
         LocalSkill {
-            id: "local-fixture".to_string(),
-            name: "fixture".to_string(),
+            id: format!("local-{directory}"),
+            name: directory.to_string(),
             description: None,
-            directory: "fixture".to_string(),
+            directory: directory.to_string(),
             content_hash,
             total_size_bytes: 0,
             file_count: 0,
@@ -916,6 +1394,21 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    fn record_from_tree(
+        directory: &str,
+        tree: &LocalSkillTree,
+        apps: crate::domain::ManagedClientApps,
+    ) -> LocalSkill {
+        let (name, description) = parse_metadata(tree, directory).unwrap();
+        let mut record = record_for(directory, Some(tree.content_hash.clone()), apps);
+        record.name = name;
+        record.description = description;
+        record.total_size_bytes = tree.total_size_bytes;
+        record.file_count = tree.file_count;
+        record.cloud_eligible = tree.is_cloud_eligible();
+        record
     }
 
     fn all_apps() -> crate::domain::ManagedClientApps {
@@ -957,6 +1450,606 @@ mod tests {
     }
 
     #[test]
+    fn managed_refresh_creates_no_rollback_point_for_an_unchanged_index() {
+        let live = tree(b"same");
+        let original = record_from_tree(
+            "fixture",
+            &live,
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees
+            .trees
+            .lock()
+            .unwrap()
+            .insert((ManagedClientId::Claude, "fixture".to_string()), live);
+        let rollbacks = MemoryRollbacks::default();
+
+        let scanned =
+            LocalSkillService::scan_unmanaged_with_rollback(&repository, &trees, &rollbacks, 10)
+                .expect("unchanged refresh succeeds");
+
+        assert_eq!(scanned.installed, vec![original]);
+        assert!(rollbacks.created.lock().unwrap().is_empty());
+        assert!(rollbacks.deleted.lock().unwrap().is_empty());
+        assert!(rollbacks.retained.lock().unwrap().is_empty());
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn managed_refresh_deletes_rollback_after_successful_index_change() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        let rollbacks = MemoryRollbacks::default();
+
+        let scanned =
+            LocalSkillService::scan_unmanaged_with_rollback(&repository, &trees, &rollbacks, 10)
+                .expect("changed refresh succeeds");
+
+        assert_eq!(scanned.removed_count, 1);
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 1);
+        let created = rollbacks.created.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, RollbackPointPurpose::SkillIndexRefresh);
+        assert_eq!(created[0].1, 10);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&created[0].2).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "skills": [original]
+            })
+        );
+        assert_eq!(rollbacks.deleted.lock().unwrap().as_slice(), ["rollback-1"]);
+        assert!(rollbacks.retained.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_refresh_retains_rollback_when_database_reconcile_fails() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            fail_reconcile: true,
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        let rollbacks = MemoryRollbacks::default();
+
+        LocalSkillService::scan_unmanaged_with_rollback(&repository, &trees, &rollbacks, 10)
+            .expect_err("database failure must retain rollback");
+
+        assert_eq!(repository.records.lock().unwrap().as_slice(), &[original]);
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 1);
+        assert_eq!(rollbacks.created.lock().unwrap().len(), 1);
+        assert!(rollbacks.deleted.lock().unwrap().is_empty());
+        assert_eq!(
+            rollbacks.retained.lock().unwrap().as_slice(),
+            &[("rollback-1".to_string(), 10)]
+        );
+    }
+
+    #[test]
+    fn managed_refresh_returns_committed_result_when_rollback_cleanup_fails() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        let rollbacks = MemoryRollbacks {
+            fail_delete: true,
+            ..Default::default()
+        };
+
+        let scanned =
+            LocalSkillService::scan_unmanaged_with_rollback(&repository, &trees, &rollbacks, 10)
+                .expect("committed refresh survives rollback cleanup failure");
+
+        assert_eq!(scanned.removed_count, 1);
+        assert!(repository.records.lock().unwrap().is_empty());
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 1);
+        assert_eq!(rollbacks.created.lock().unwrap().len(), 1);
+        assert_eq!(rollbacks.deleted.lock().unwrap().as_slice(), ["rollback-1"]);
+        assert_eq!(
+            rollbacks.retained.lock().unwrap().as_slice(),
+            &[("rollback-1".to_string(), 10)]
+        );
+    }
+
+    #[test]
+    fn rollback_create_failure_prevents_any_database_reconcile() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        let rollbacks = MemoryRollbacks {
+            fail_create: true,
+            ..Default::default()
+        };
+
+        LocalSkillService::scan_unmanaged_with_rollback(&repository, &trees, &rollbacks, 10)
+            .expect_err("rollback protection failure must stop before database writes");
+
+        assert_eq!(repository.records.lock().unwrap().as_slice(), &[original]);
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 0);
+        assert!(rollbacks.created.lock().unwrap().is_empty());
+        assert!(rollbacks.deleted.lock().unwrap().is_empty());
+        assert!(rollbacks.retained.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_refresh_removes_a_record_when_all_three_copies_are_gone() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("empty live roots remove the managed record");
+
+        assert!(scanned.installed.is_empty());
+        assert_eq!(scanned.removed_count, 1);
+        assert_eq!(scanned.updated_count, 0);
+        assert!(scanned.issues.is_empty());
+    }
+
+    #[test]
+    fn managed_refresh_disables_a_client_whose_copy_was_deleted() {
+        let live = tree(b"same");
+        let original = record_from_tree("fixture", &live, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        for client in [ManagedClientId::Claude, ManagedClientId::Codex] {
+            trees
+                .trees
+                .lock()
+                .unwrap()
+                .insert((client, "fixture".to_string()), live.clone());
+        }
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("actual copies refresh enabled apps");
+
+        assert_eq!(scanned.updated_count, 1);
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(
+            scanned.installed[0].apps,
+            ManagedClientApps {
+                claude: true,
+                codex: true,
+                opencode: false,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_refresh_enables_a_previously_disabled_client_that_now_has_a_copy() {
+        let live = tree(b"same");
+        let original = record_from_tree(
+            "fixture",
+            &live,
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        for client in [ManagedClientId::Claude, ManagedClientId::Opencode] {
+            trees
+                .trees
+                .lock()
+                .unwrap()
+                .insert((client, "fixture".to_string()), live.clone());
+        }
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("a safe disabled-client copy is locally authoritative");
+
+        assert_eq!(scanned.updated_count, 1);
+        assert_eq!(
+            scanned.installed[0].apps,
+            ManagedClientApps {
+                claude: true,
+                codex: false,
+                opencode: true,
+            }
+        );
+    }
+
+    #[test]
+    fn managed_refresh_adopts_identical_live_metadata_and_measurements() {
+        let live = tree_from_contents(
+            b"---\nname: Refreshed\ndescription: Live metadata\n---\nbody".to_vec(),
+        );
+        let original = record(
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        for client in [ManagedClientId::Claude, ManagedClientId::Codex] {
+            trees
+                .trees
+                .lock()
+                .unwrap()
+                .insert((client, "fixture".to_string()), live.clone());
+        }
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("identical copies refresh canonical metadata");
+        let refreshed = &scanned.installed[0];
+
+        assert_eq!(scanned.updated_count, 1);
+        assert_eq!(refreshed.name, "Refreshed");
+        assert_eq!(refreshed.description.as_deref(), Some("Live metadata"));
+        assert_eq!(
+            refreshed.content_hash.as_deref(),
+            Some(live.content_hash.as_str())
+        );
+        assert_eq!(refreshed.total_size_bytes, live.total_size_bytes);
+        assert_eq!(refreshed.file_count, live.file_count);
+        assert!(refreshed.cloud_eligible);
+    }
+
+    #[test]
+    fn divergent_managed_copies_preserve_metadata_but_refresh_actual_apps() {
+        let original = record(Some("a".repeat(64)), all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            tree_from_contents(b"---\nname: Claude Changed\n---\nclaude".to_vec()),
+        );
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Codex, "fixture".to_string()),
+            tree_from_contents(b"---\nname: Codex Changed\n---\ncodex".to_vec()),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("divergence is reported without choosing a canonical copy");
+        let refreshed = &scanned.installed[0];
+
+        assert_eq!(scanned.updated_count, 1);
+        assert_eq!(refreshed.name, original.name);
+        assert_eq!(refreshed.description, original.description);
+        assert_eq!(refreshed.content_hash, original.content_hash);
+        assert_eq!(refreshed.total_size_bytes, original.total_size_bytes);
+        assert_eq!(refreshed.file_count, original.file_count);
+        assert_eq!(refreshed.cloud_eligible, original.cloud_eligible);
+        assert_eq!(
+            refreshed.apps,
+            ManagedClientApps {
+                claude: true,
+                codex: true,
+                opencode: false,
+            }
+        );
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(
+            scanned.issues[0].kind,
+            LocalSkillScanIssueKind::DivergentCopies
+        );
+    }
+
+    #[test]
+    fn divergent_accepted_copies_are_not_reported_as_divergent() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        for client in ManagedClientId::ALL {
+            trees.trees.lock().unwrap().insert(
+                (client, "fixture".to_string()),
+                tree(format!("{}-config", client.as_str()).as_bytes()),
+            );
+        }
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("accepted divergence is not reported");
+        let refreshed = &scanned.installed[0];
+
+        assert_eq!(scanned.updated_count, 1);
+        assert_eq!(refreshed.content_hash, None);
+        assert!(!refreshed.cloud_eligible);
+        assert_eq!(scanned.issues.len(), 0);
+        assert_eq!(
+            refreshed.apps,
+            ManagedClientApps {
+                claude: true,
+                codex: true,
+                opencode: true,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_managed_copy_preserves_the_original_record() {
+        let original = record(Some("a".repeat(64)), all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            tree_from_contents(b"---\nname: [\n---\ninvalid".to_vec()),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("invalid copy is isolated from database reconciliation");
+
+        assert_eq!(scanned.installed, vec![original]);
+        assert_eq!(scanned.updated_count, 0);
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(scanned.issues[0].kind, LocalSkillScanIssueKind::InvalidCopy);
+        assert_eq!(scanned.issues[0].clients, vec![ManagedClientId::Claude]);
+    }
+
+    #[test]
+    fn skill_directory_identity_uses_full_unicode_case_folding() {
+        assert_eq!(skill_directory_identity("Σ"), skill_directory_identity("ς"));
+        assert_eq!(skill_directory_identity("Ä"), skill_directory_identity("ä"));
+        assert_eq!(
+            skill_directory_identity("Straße"),
+            skill_directory_identity("STRASSE")
+        );
+    }
+
+    #[test]
+    fn live_only_case_spellings_are_reported_and_not_offered_for_import() {
+        let repository = FailingRepository::default();
+        let trees = MemoryTrees::default();
+        trees
+            .trees
+            .lock()
+            .unwrap()
+            .insert((ManagedClientId::Claude, "Foo".to_string()), tree(b"upper"));
+        trees
+            .trees
+            .lock()
+            .unwrap()
+            .insert((ManagedClientId::Codex, "foo".to_string()), tree(b"lower"));
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("live spelling collision is isolated");
+
+        assert!(scanned.installed.is_empty());
+        assert!(scanned.unmanaged.is_empty());
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(scanned.issues[0].directory, "Foo");
+        assert_eq!(
+            scanned.issues[0].kind,
+            LocalSkillScanIssueKind::CaseCollision
+        );
+        assert_eq!(
+            scanned.issues[0].clients,
+            vec![ManagedClientId::Claude, ManagedClientId::Codex]
+        );
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+        assert!(trees.manifest_reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unicode_case_only_live_spelling_change_preserves_database_identity() {
+        let original = record_for(
+            "Σ",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "ς".to_string()),
+            tree(b"unicode case changed"),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("Unicode case-only spelling mismatch is isolated");
+
+        assert_eq!(scanned.installed, vec![original]);
+        assert!(scanned.unmanaged.is_empty());
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(
+            scanned.issues[0].kind,
+            LocalSkillScanIssueKind::CaseCollision
+        );
+    }
+
+    #[test]
+    fn case_only_live_spelling_change_preserves_database_identity_and_is_not_unmanaged() {
+        let original = record_for(
+            "Foo",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "foo".to_string()),
+            tree(b"case changed"),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("case-only spelling mismatch is isolated");
+
+        assert_eq!(scanned.installed, vec![original]);
+        assert!(scanned.unmanaged.is_empty());
+        assert_eq!(scanned.updated_count, 0);
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(scanned.issues[0].directory, "Foo");
+        assert_eq!(
+            scanned.issues[0].kind,
+            LocalSkillScanIssueKind::CaseCollision
+        );
+        assert_eq!(scanned.issues[0].clients, vec![ManagedClientId::Claude]);
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+        assert!(trees.manifest_reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn case_insensitive_database_duplicates_preserve_both_records() {
+        let upper = record_for(
+            "Foo",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let mut lower = record_for(
+            "foo",
+            Some("b".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Codex),
+        );
+        lower.id = "local-foo-lower".to_string();
+        let repository = FailingRepository {
+            records: Mutex::new(vec![upper.clone(), lower.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("database collision must not delete either identity");
+
+        assert_eq!(scanned.installed, vec![upper, lower]);
+        assert_eq!(scanned.updated_count, 0);
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(scanned.issues.len(), 2);
+        assert!(scanned
+            .issues
+            .iter()
+            .all(|issue| issue.kind == LocalSkillScanIssueKind::CaseCollision));
+        assert_eq!(*repository.reconcile_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn case_collision_preserves_managed_record_and_suppresses_unmanaged_import() {
+        let original = record(
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            tree(b"lower"),
+        );
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Codex, "Fixture".to_string()),
+            tree(b"upper"),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("case collision is an isolated managed issue");
+
+        assert_eq!(scanned.installed, vec![original]);
+        assert!(scanned.unmanaged.is_empty());
+        assert_eq!(scanned.updated_count, 0);
+        assert_eq!(scanned.removed_count, 0);
+        assert_eq!(scanned.issues.len(), 1);
+        assert_eq!(
+            scanned.issues[0].kind,
+            LocalSkillScanIssueKind::CaseCollision
+        );
+        assert_eq!(
+            scanned.issues[0].clients,
+            vec![ManagedClientId::Claude, ManagedClientId::Codex]
+        );
+    }
+
+    #[test]
+    fn directory_rename_is_old_managed_removal_plus_new_unmanaged_discovery() {
+        let original = record_for(
+            "old-name",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "new-name".to_string()),
+            tree_from_contents(b"---\nname: Renamed\n---\nbody".to_vec()),
+        );
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("renames are not silently adopted into managed identity");
+
+        assert!(scanned.installed.is_empty());
+        assert_eq!(scanned.removed_count, 1);
+        assert_eq!(scanned.updated_count, 0);
+        assert_eq!(scanned.unmanaged.len(), 1);
+        assert_eq!(scanned.unmanaged[0].directory, "new-name");
+        assert_eq!(scanned.unmanaged[0].name, "Renamed");
+    }
+
+    #[test]
+    fn repository_reconcile_failure_keeps_updates_and_deletes_uncommitted() {
+        let changed = tree_from_contents(b"---\nname: Changed\n---\nbody".to_vec());
+        let update_original = record_for(
+            "update",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let remove_original = record_for(
+            "remove",
+            Some("b".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Codex),
+        );
+        let originals = vec![update_original, remove_original];
+        let repository = FailingRepository {
+            records: Mutex::new(originals.clone()),
+            fail_reconcile: true,
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees
+            .trees
+            .lock()
+            .unwrap()
+            .insert((ManagedClientId::Claude, "update".to_string()), changed);
+
+        LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect_err("reconcile failure must reject the whole planned batch");
+
+        assert_eq!(repository.records.lock().unwrap().as_slice(), originals);
+    }
+
+    #[test]
     fn unmanaged_scan_keeps_valid_skills_when_one_manifest_is_malformed() {
         let repository = FailingRepository::default();
         let trees = MemoryTrees::default();
@@ -975,65 +2068,282 @@ mod tests {
         let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
             .expect("one malformed manifest must not hide valid Skills");
 
-        assert_eq!(scanned.len(), 1);
-        assert_eq!(scanned[0].directory, "working");
-        assert_eq!(scanned[0].name, "Working Skill");
+        assert_eq!(scanned.unmanaged.len(), 1);
+        assert_eq!(scanned.unmanaged[0].directory, "working");
+        assert_eq!(scanned.unmanaged[0].name, "Working Skill");
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn unmanaged_scan_reports_per_client_content_hashes() {
+    fn unmanaged_scan_separates_managed_full_capture_from_unmanaged_manifest_read() {
+        let repository = FailingRepository {
+            records: Mutex::new(vec![record(None, all_apps())]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        {
+            let mut stored = trees.trees.lock().unwrap();
+            stored.insert(
+                (ManagedClientId::Claude, "fixture".to_string()),
+                tree(b"managed must not be read"),
+            );
+            stored.insert(
+                (ManagedClientId::Claude, "unmanaged".to_string()),
+                tree_from_contents(b"---\nname: Unmanaged\n---\n".to_vec()),
+            );
+        }
+
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("scan unmanaged manifests");
+
+        assert_eq!(scanned.installed.len(), 1);
+        assert_eq!(scanned.unmanaged.len(), 1);
+        assert_eq!(scanned.unmanaged[0].directory, "unmanaged");
+        assert_eq!(
+            trees.manifest_reads.lock().unwrap().as_slice(),
+            &[(ManagedClientId::Claude, "unmanaged".to_string())]
+        );
+        assert_eq!(
+            trees.capture_reads.lock().unwrap().as_slice(),
+            &[(ManagedClientId::Claude, "fixture".to_string())]
+        );
+    }
+
+    #[test]
+    fn unmanaged_scan_propagates_directory_listing_io_failures_without_database_changes() {
+        let original = record(None, all_apps());
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        let sensitive_path = r"\\wsl.localhost\Ubuntu\home\zhldm\.claude\skills";
+        *trees.fail_list.lock().unwrap() = Some(LocalSkillTreeError::new(
+            LocalSkillTreeErrorCode::Io,
+            format!("injected directory listing failure: {sensitive_path}"),
+        ));
+
+        let error = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect_err("directory listing failures must not look like an empty scan");
+
+        assert!(error.to_string().contains("kind=Io"));
+        assert!(!error.to_string().contains(sensitive_path));
+        assert_eq!(repository.records.lock().unwrap().as_slice(), &[original]);
+    }
+
+    #[test]
+    fn unmanaged_scan_propagates_manifest_io_failures() {
         let repository = FailingRepository::default();
         let trees = MemoryTrees::default();
-        let consistent = tree(b"same");
-        let solo_tree = tree(b"claude-only");
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "unmanaged".to_string()),
+            tree(b"manifest"),
+        );
+        let sensitive_path = r"\\wsl.localhost\Ubuntu\home\zhldm\.claude\skills\unmanaged\SKILL.md";
+        *trees.fail_manifest.lock().unwrap() = Some(LocalSkillTreeError::new(
+            LocalSkillTreeErrorCode::Io,
+            format!("injected manifest I/O failure: {sensitive_path}"),
+        ));
+
+        let error = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect_err("manifest I/O failures must not be skipped as invalid metadata");
+
+        assert!(error.to_string().contains("kind=Io"));
+        assert!(!error.to_string().contains(sensitive_path));
+    }
+
+    #[test]
+    fn unmanaged_scan_aggregates_the_same_directory_across_three_clients() {
+        let repository = FailingRepository::default();
+        let trees = MemoryTrees::default();
         {
             let mut stored = trees.trees.lock().unwrap();
             stored.insert(
                 (ManagedClientId::Claude, "shared".to_string()),
-                consistent.clone(),
+                tree_from_contents(b"---\nname: Shared Skill\n---\nclaude".to_vec()),
             );
             stored.insert(
                 (ManagedClientId::Codex, "shared".to_string()),
-                consistent.clone(),
+                tree_from_contents(b"---\nname: Shared Skill\n---\ncodex".to_vec()),
             );
             stored.insert(
                 (ManagedClientId::Opencode, "shared".to_string()),
-                tree(b"divergent"),
-            );
-            stored.insert(
-                (ManagedClientId::Claude, "solo".to_string()),
-                solo_tree.clone(),
+                tree_from_contents(b"---\nname: Shared Skill\n---\nopencode".to_vec()),
             );
         }
 
-        let mut scanned =
-            LocalSkillService::scan_unmanaged_with(&repository, &trees).expect("scan must succeed");
-        scanned.sort_by(|left, right| left.directory.cmp(&right.directory));
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("scan must aggregate by directory");
 
-        assert_eq!(scanned.len(), 2);
-        let solo = &scanned[1];
-        assert_eq!(solo.directory, "solo");
-        assert_eq!(solo.copies.len(), 1);
-        assert_eq!(solo.copies[0].client, ManagedClientId::Claude);
-        assert_eq!(solo.copies[0].content_hash, solo_tree.content_hash);
-
-        let shared = &scanned[0];
-        assert_eq!(shared.directory, "shared");
+        assert_eq!(scanned.unmanaged.len(), 1);
+        assert_eq!(scanned.unmanaged[0].directory, "shared");
+        assert_eq!(scanned.unmanaged[0].name, "Shared Skill");
         assert_eq!(
-            shared
-                .copies
-                .iter()
-                .map(|copy| copy.client)
-                .collect::<Vec<_>>(),
+            scanned.unmanaged[0].found_in,
             vec![
                 ManagedClientId::Claude,
                 ManagedClientId::Codex,
                 ManagedClientId::Opencode,
             ]
         );
-        assert_eq!(shared.copies[0].content_hash, consistent.content_hash);
-        assert_eq!(shared.copies[1].content_hash, consistent.content_hash);
-        assert_ne!(shared.copies[2].content_hash, consistent.content_hash);
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_unicode_casefold_alias_of_a_managed_directory() {
+        let original = record_for(
+            "Ä",
+            Some("a".repeat(64)),
+            ManagedClientApps::only(ManagedClientId::Claude),
+        );
+        let repository = FailingRepository {
+            records: Mutex::new(vec![original.clone()]),
+            ..Default::default()
+        };
+        let trees = MemoryTrees::default();
+        trees
+            .trees
+            .lock()
+            .unwrap()
+            .insert((ManagedClientId::Codex, "ä".to_string()), tree(b"alias"));
+
+        LocalSkillService::import_with(
+            &repository,
+            &trees,
+            vec![LocalSkillImport {
+                directory: "ä".to_string(),
+                source_client: ManagedClientId::Codex,
+                apps: ManagedClientApps::only(ManagedClientId::Codex),
+            }],
+            2,
+        )
+        .expect_err("Unicode alias of managed directory must not be imported");
+
+        assert_eq!(repository.records.lock().unwrap().as_slice(), &[original]);
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_unicode_casefold_aliases_in_the_same_batch() {
+        let repository = FailingRepository::default();
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "Straße".to_string()),
+            tree(b"first"),
+        );
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Codex, "STRASSE".to_string()),
+            tree(b"second"),
+        );
+
+        LocalSkillService::import_with(
+            &repository,
+            &trees,
+            vec![
+                LocalSkillImport {
+                    directory: "Straße".to_string(),
+                    source_client: ManagedClientId::Claude,
+                    apps: ManagedClientApps::only(ManagedClientId::Claude),
+                },
+                LocalSkillImport {
+                    directory: "STRASSE".to_string(),
+                    source_client: ManagedClientId::Codex,
+                    apps: ManagedClientApps::only(ManagedClientId::Codex),
+                },
+            ],
+            2,
+        )
+        .expect_err("Unicode case-fold aliases in one batch must be rejected");
+
+        assert!(repository.records.lock().unwrap().is_empty());
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_recaptures_the_source_after_manifest_discovery() {
+        let repository = FailingRepository::default();
+        let trees = MemoryTrees::default();
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            tree_from_contents(b"---\nname: Before Scan\n---\nold".to_vec()),
+        );
+        let scanned = LocalSkillService::scan_unmanaged_with(&repository, &trees)
+            .expect("discover the initial manifest");
+        assert_eq!(scanned.unmanaged[0].name, "Before Scan");
+        assert!(trees.capture_reads.lock().unwrap().is_empty());
+
+        let changed = tree_from_contents(b"---\nname: After Scan\n---\nnew".to_vec());
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            changed.clone(),
+        );
+        let imported = LocalSkillService::import_with(
+            &repository,
+            &trees,
+            vec![LocalSkillImport {
+                directory: "fixture".to_string(),
+                source_client: ManagedClientId::Claude,
+                apps: crate::domain::ManagedClientApps::only(ManagedClientId::Claude),
+            }],
+            1,
+        )
+        .expect("import must recapture the changed source");
+
+        assert_eq!(imported[0].name, "After Scan");
+        assert_eq!(
+            imported[0].content_hash.as_deref(),
+            Some(changed.content_hash.as_str())
+        );
+        assert_eq!(
+            trees.capture_reads.lock().unwrap().as_slice(),
+            &[(ManagedClientId::Claude, "fixture".to_string())]
+        );
+    }
+
+    #[test]
+    fn import_adopts_divergent_same_named_copies_without_error() {
+        let repository = FailingRepository::default();
+        let trees = MemoryTrees::default();
+        let source = tree(b"claude-content");
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Claude, "fixture".to_string()),
+            source.clone(),
+        );
+        // Codex has a same-named copy whose content differs (e.g. per-agent config).
+        let diverged = tree(b"codex-config");
+        trees.trees.lock().unwrap().insert(
+            (ManagedClientId::Codex, "fixture".to_string()),
+            diverged.clone(),
+        );
+
+        let imported = LocalSkillService::import_with(
+            &repository,
+            &trees,
+            vec![LocalSkillImport {
+                directory: "fixture".to_string(),
+                source_client: ManagedClientId::Claude,
+                apps: crate::domain::ManagedClientApps {
+                    claude: true,
+                    codex: true,
+                    opencode: false,
+                },
+            }],
+            1,
+        )
+        .expect("divergent same-named copies are adopted as-is");
+
+        assert_eq!(imported[0].content_hash, None);
+        assert!(!imported[0].cloud_eligible);
+        // The diverged codex copy is left untouched (not overwritten).
+        assert_eq!(
+            trees
+                .trees
+                .lock()
+                .unwrap()
+                .get(&(ManagedClientId::Codex, "fixture".to_string())),
+            Some(&diverged)
+        );
+        assert_eq!(repository.records.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1199,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_without_a_baseline_is_zero_write_rejected() {
+    fn delete_without_a_baseline_removes_the_managed_copy() {
         let source = tree(b"unconfirmed");
         let repository = FailingRepository {
             records: Mutex::new(vec![record(
@@ -1214,8 +2524,10 @@ mod tests {
             source.clone(),
         );
 
-        LocalSkillService::remove_with(&repository, &trees, "local-fixture")
-            .expect_err("unconfirmed migrated Skill cannot be deleted");
+        // 分歧接受（无统一基线）的 Skill 仍然可以删除：直接移除受管目录。
+        let removed = LocalSkillService::remove_with(&repository, &trees, "local-fixture")
+            .expect("a Skill without a unified baseline can still be removed");
+        assert!(removed);
 
         assert_eq!(
             trees
@@ -1223,9 +2535,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&(ManagedClientId::Claude, "fixture".to_string())),
-            Some(&source)
+            None
         );
-        assert_eq!(repository.records.lock().unwrap().len(), 1);
+        assert_eq!(repository.records.lock().unwrap().len(), 0);
     }
 
     #[test]

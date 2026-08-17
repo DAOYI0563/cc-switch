@@ -45,16 +45,16 @@ pub use prompt::Prompt;
 pub use provider::{Provider, ProviderMeta};
 pub use services::{
     apply_committed_sync_batch, default_local_actions, list_conflict_center_items,
-    local_reconciliation_items, reconciliation_snapshot_from_parsed, record_local_writes,
-    record_runtime_local_writes, resolve_conflict_center_item, sync_manifest_remote_path,
-    sync_record_remote_path, CommonSnippetService, ConflictCenterRuntimeState,
-    InMemoryLocalReconciliationBaselines, LocalScanCadence, LocalScanConflictSource,
-    LocalScanCoordinator, LocalScanExecutor, LocalScanParsedChange, LocalScanRuntimeState,
-    LocalScanScheduler, LocalScanSchedulerError, LocalScanWorker, LocalScanWriteRegistration,
-    LocalScanWriteTracker, LocalSkillService, McpService, PromptService, ProviderService,
-    SyncDeviceRetireRequest, SyncFirstSyncConfirmRequest, SyncFirstSyncPreviewRequest,
-    SyncRunError, SyncRunErrorCode, SyncRunRequest, SyncRunResult, SyncV3Orchestrator,
-    WebDavConflictSource,
+    local_reconciliation_items, reconciliation_snapshot_from_parsed, record_database_local_writes,
+    record_local_writes, record_runtime_local_writes, resolve_conflict_center_item,
+    sync_manifest_remote_path, sync_record_remote_path, CommonSnippetService,
+    ConflictCenterRuntimeState, InMemoryLocalReconciliationBaselines, LocalScanCadence,
+    LocalScanConflictSource, LocalScanCoordinator, LocalScanExecutor, LocalScanParsedChange,
+    LocalScanRuntimeState, LocalScanScheduler, LocalScanSchedulerError, LocalScanWorker,
+    LocalScanWriteRegistration, LocalScanWriteTracker, LocalSkillService, McpService,
+    PromptService, ProviderService, SyncDeviceRetireRequest, SyncFirstSyncConfirmRequest,
+    SyncFirstSyncPreviewRequest, SyncRunError, SyncRunErrorCode, SyncRunRequest, SyncRunResult,
+    SyncV3Orchestrator, WebDavConflictSource,
 };
 pub use settings::{update_settings, AppSettings};
 pub use store::AppState;
@@ -204,13 +204,13 @@ fn initialize_runtime_state(app: &mut tauri::App, state: AppState) -> Result<(),
         let _ = tray_icon.set_visible(false);
     }
 
-    let local_scan_source =
-        Arc::new(adapters::local_scan_summary::FixedLocalScanSummaryAdapter::runtime());
+    let (local_scan_source, managed_skill_inventory) =
+        adapters::local_scan_summary::DatabaseLocalScanSummaryAdapter::runtime(state.db.clone());
     let local_scan_parser =
-        Arc::new(adapters::local_scan_parser::FixedLocalScanParserAdapter::runtime());
+        adapters::local_scan_parser::DatabaseLocalScanParserAdapter::new(managed_skill_inventory);
     let local_scan_coordinator = Arc::new(services::LocalScanCoordinator::new(
-        local_scan_source,
-        local_scan_parser,
+        Arc::new(local_scan_source),
+        Arc::new(local_scan_parser),
         state.local_scan_writes.clone(),
     ));
     let local_reconciliation_baselines =

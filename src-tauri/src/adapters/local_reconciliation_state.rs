@@ -131,22 +131,41 @@ impl DatabaseLocalReconciliationStateAdapter {
             .map_err(|_| read_failure(None))?
             .into_iter()
             .filter(|skill| skill.apps.is_enabled_for(client))
-            .map(|skill| {
-                let directory = skill.directory.clone();
-                LocalScanParsedRecord::new(
-                    directory.clone(),
-                    json!({
-                        "name": skill.name,
-                        "description": skill.description,
-                        "contentHash": skill.content_hash,
-                        "totalSizeBytes": skill.total_size_bytes,
-                        "fileCount": skill.file_count,
-                        "cloudEligible": skill.cloud_eligible,
-                    }),
-                )
-                .map_err(|_| read_failure(Some(&directory)))
-            })
+            .map(skill_parsed_record)
             .collect()
+    }
+
+    fn skill_reconciliation_state(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalReconciliationState, LocalScanReadFailure> {
+        let skills = self
+            .database
+            .list_core_skills()
+            .map_err(|_| read_failure(None))?;
+        let local_records = skills
+            .iter()
+            .filter(|skill| skill.apps.is_enabled_for(target.client_id))
+            .cloned()
+            .map(skill_parsed_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let confirmed_records = skills
+            .into_iter()
+            .filter(|skill| {
+                skill.apps.is_enabled_for(target.client_id) && skill.content_hash.is_some()
+            })
+            .map(skill_parsed_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        let local = reconciliation_snapshot_from_parsed(
+            &LocalScanParsedSnapshot::new(target, local_records).map_err(|_| read_failure(None))?,
+        )
+        .map_err(|_| read_failure(None))?;
+        let baseline = reconciliation_snapshot_from_parsed(
+            &LocalScanParsedSnapshot::new(target, confirmed_records)
+                .map_err(|_| read_failure(None))?,
+        )
+        .map_err(|_| read_failure(None))?;
+        LocalReconciliationState::new(target, Some(baseline), local).map_err(|_| read_failure(None))
     }
 }
 
@@ -155,11 +174,35 @@ impl LocalReconciliationStatePort for DatabaseLocalReconciliationStateAdapter {
         &self,
         target: LocalScanTarget,
     ) -> Result<LocalReconciliationState, LocalScanReadFailure> {
+        if target.domain == LocalScanDomain::Skill {
+            // Skill metadata is itself the persisted confirmation record. Build
+            // canonical reconciliation digests from one normalized DB snapshot;
+            // never substitute raw tree content_hash values here.
+            return self.skill_reconciliation_state(target);
+        }
         let local = reconciliation_snapshot_from_parsed(&self.read_parsed_local(target)?)
             .map_err(|_| read_failure(None))?;
         LocalReconciliationState::new(target, self.baselines.read_baseline(target), local)
             .map_err(|_| read_failure(None))
     }
+}
+
+fn skill_parsed_record(
+    skill: crate::domain::LocalSkill,
+) -> Result<LocalScanParsedRecord, LocalScanReadFailure> {
+    let directory = skill.directory.clone();
+    LocalScanParsedRecord::new(
+        directory.clone(),
+        json!({
+            "name": skill.name,
+            "description": skill.description,
+            "contentHash": skill.content_hash,
+            "totalSizeBytes": skill.total_size_bytes,
+            "fileCount": skill.file_count,
+            "cloudEligible": skill.cloud_eligible,
+        }),
+    )
+    .map_err(|_| read_failure(Some(&directory)))
 }
 
 fn opencode_provider_fragment(provider_id: &str, settings: &Value) -> Option<Value> {

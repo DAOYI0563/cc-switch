@@ -1,14 +1,22 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::domain::{validate_skill_directory, ManagedClientId};
 use crate::ports::{
-    LocalSkillFile, LocalSkillLiveCandidate, LocalSkillTree, LocalSkillTreeError,
-    LocalSkillTreeErrorCode, LocalSkillTreePort, LocalSkillTreeSnapshot, WslPathAccess,
-    WslPathError, WslPathErrorCode, WslPathGuard, WslPathScope,
+    LocalSkillDirectoryCandidate, LocalSkillFile, LocalSkillLiveCandidate, LocalSkillTree,
+    LocalSkillTreeError, LocalSkillTreeErrorCode, LocalSkillTreePort, LocalSkillTreeSnapshot,
+    WslPathAccess, WslPathError, WslPathErrorCode, WslPathGuard, WslPathScope,
 };
+// `open_checked_manifest` is `#[cfg(windows)]`, so this trait is only used on Windows.
+// On other hosts it is an unused import; that is expected and harmless.
+#[cfg(windows)]
+use crate::ports::WslPathResolver;
+#[cfg(not(windows))]
+#[allow(unused_imports)]
+use crate::ports::WslPathResolver;
 
 use super::wsl_path_guard::SafeWslPathGuard;
 use super::wsl_paths::FixedWslPathResolver;
@@ -16,34 +24,34 @@ use super::wsl_paths::FixedWslPathResolver;
 /// Protected ordinary-file tree access for the three fixed live Skill roots.
 #[derive(Debug, Clone)]
 pub struct LocalSkillTreeAdapter {
+    resolver: FixedWslPathResolver,
     guard: SafeWslPathGuard<FixedWslPathResolver>,
 }
 
 impl LocalSkillTreeAdapter {
     pub fn runtime() -> Self {
+        let resolver = FixedWslPathResolver::runtime();
         Self {
-            guard: SafeWslPathGuard::new(FixedWslPathResolver::runtime()),
+            guard: SafeWslPathGuard::new(resolver.clone()),
+            resolver,
         }
     }
 
-    /// Strict scan used by background reconciliation. Unlike the import UI's
-    /// tolerant scan, one unsafe or malformed candidate fails the target.
+    /// Strict full-tree scan used by background reconciliation. One unsafe or
+    /// malformed candidate fails the target so reconciliation cannot accept a
+    /// partial summary.
     pub fn scan_strict(
         &self,
         client: ManagedClientId,
     ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError> {
-        self.scan_candidates(client, true)
-    }
-
-    fn scan_candidates(
-        &self,
-        client: ManagedClientId,
-        strict: bool,
-    ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError> {
+        self.ensure_home_accessible()?;
         let root = self.resolve(client, "skills", WslPathAccess::Read)?;
         let entries = match fs::read_dir(&root) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.ensure_home_accessible()?;
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(io_error(&root, error)),
         };
         let mut candidates = Vec::new();
@@ -55,35 +63,14 @@ impl LocalSkillTreeAdapter {
                     "Skill 目录名无法表示为 UTF-8",
                 )
             })?;
-            if validate_skill_directory(&directory).is_err() {
-                if strict {
-                    return Err(LocalSkillTreeError::new(
-                        LocalSkillTreeErrorCode::InvalidPath,
-                        "Skill 根目录包含无效目录名",
-                    ));
-                }
+            validate_skill_directory(&directory).map_err(|_| {
+                LocalSkillTreeError::new(
+                    LocalSkillTreeErrorCode::InvalidPath,
+                    "Skill 根目录包含无效目录名",
+                )
+            })?;
+            let Some(tree) = self.read_tree(client, &directory)? else {
                 continue;
-            }
-            let tree = match self.read_tree(client, &directory) {
-                Ok(Some(tree)) => tree,
-                Ok(None) => continue,
-                Err(error)
-                    if !strict
-                        && matches!(
-                            error.code,
-                            LocalSkillTreeErrorCode::LinkNotAllowed
-                                | LocalSkillTreeErrorCode::InvalidTree
-                        ) =>
-                {
-                    log::warn!(
-                        "跳过不安全或无效的 {} Skill {}: {}",
-                        client.as_str(),
-                        directory,
-                        error
-                    );
-                    continue;
-                }
-                Err(error) => return Err(error),
             };
             candidates.push(LocalSkillLiveCandidate {
                 client,
@@ -94,6 +81,201 @@ impl LocalSkillTreeAdapter {
         }
         candidates.sort_by(|left, right| left.directory.cmp(&right.directory));
         Ok(candidates)
+    }
+
+    /// Reads only database-known directories for background reconciliation.
+    /// Unknown first-level entries are deliberately never enumerated here; they
+    /// remain visible exclusively through the explicit import flow.
+    pub fn scan_managed(
+        &self,
+        client: ManagedClientId,
+        directories: impl IntoIterator<Item = String>,
+    ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError> {
+        self.ensure_home_accessible()?;
+        let mut directories: Vec<_> = directories.into_iter().collect();
+        directories.sort();
+        directories.dedup();
+
+        let mut candidates = Vec::with_capacity(directories.len());
+        for directory in directories {
+            let Some(tree) = self.read_tree(client, &directory)? else {
+                continue;
+            };
+            let relative = Self::skill_relative(&directory)?;
+            let path = self.resolve(client, &relative, WslPathAccess::Read)?;
+            candidates.push(LocalSkillLiveCandidate {
+                client,
+                directory,
+                path: path.to_string_lossy().to_string(),
+                tree,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// First-level listing shared by managed refresh and explicit import.
+    /// No manifest or descendant is read here; validly named unsafe entries stay
+    /// visible so managed reconciliation can report them instead of deleting.
+    fn list_safe_directories(
+        &self,
+        client: ManagedClientId,
+    ) -> Result<Vec<LocalSkillDirectoryCandidate>, LocalSkillTreeError> {
+        self.ensure_home_accessible()?;
+        let root = self.resolve(client, "skills", WslPathAccess::Read)?;
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.ensure_home_accessible()?;
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(io_error(&root, error)),
+        };
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error(&root, error))?;
+            let directory = match entry.file_name().into_string() {
+                Ok(directory) => directory,
+                Err(_) => {
+                    log::warn!("跳过名称不是 UTF-8 的 {} Skill 目录项", client.as_str());
+                    continue;
+                }
+            };
+            if validate_skill_directory(&directory).is_err() {
+                log::warn!(
+                    "跳过名称无效的 {} Skill 目录: {}",
+                    client.as_str(),
+                    directory
+                );
+                continue;
+            }
+            // Retain every valid first-level name. Managed reconciliation must
+            // see linked or otherwise invalid entries and preserve the database
+            // record with an InvalidCopy issue instead of treating it as deleted.
+            // Unknown entries are still guarded by the bounded manifest read.
+            candidates.push(LocalSkillDirectoryCandidate {
+                client,
+                directory,
+                path: entry.path().to_string_lossy().to_string(),
+            });
+        }
+        candidates.sort_by(|left, right| left.directory.cmp(&right.directory));
+        Ok(candidates)
+    }
+
+    fn ensure_home_accessible(&self) -> Result<(), LocalSkillTreeError> {
+        let home = self.resolver.windows_home();
+        let metadata = fs::symlink_metadata(home).map_err(|error| io_error(home, error))?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(LocalSkillTreeError::new(
+                LocalSkillTreeErrorCode::LinkNotAllowed,
+                "WSL 用户目录不得是链接或重解析点",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(LocalSkillTreeError::new(
+                LocalSkillTreeErrorCode::InvalidTree,
+                "WSL 用户目录不是普通目录",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_manifest_only(
+        &self,
+        candidate: &LocalSkillDirectoryCandidate,
+    ) -> Result<Option<Vec<u8>>, LocalSkillTreeError> {
+        let base_relative = Self::skill_relative(&candidate.directory)?;
+        let manifest_relative = format!("{base_relative}/SKILL.md");
+        let manifest = self.resolve(candidate.client, &manifest_relative, WslPathAccess::Read)?;
+        let mut file =
+            match self.open_checked_manifest(candidate.client, &manifest_relative, &manifest) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(LocalSkillTreeError::new(
+                        LocalSkillTreeErrorCode::InvalidTree,
+                        "Skill manifest 无法安全读取",
+                    ));
+                }
+                Err(error) => return Err(io_error(&manifest, error)),
+            };
+        match read_manifest_metadata_prefix(&mut file) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                Err(LocalSkillTreeError::new(
+                    LocalSkillTreeErrorCode::InvalidTree,
+                    "Skill manifest 元数据无效",
+                ))
+            }
+            Err(error) => Err(io_error(&manifest, error)),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn open_checked_manifest(
+        &self,
+        _client: ManagedClientId,
+        _manifest_relative: &str,
+        manifest: &Path,
+    ) -> std::io::Result<fs::File> {
+        let metadata = fs::symlink_metadata(manifest)?;
+        if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Skill manifest 不是普通的非链接文件",
+            ));
+        }
+        fs::File::open(manifest)
+    }
+
+    #[cfg(windows)]
+    fn open_checked_manifest(
+        &self,
+        client: ManagedClientId,
+        manifest_relative: &str,
+        manifest: &Path,
+    ) -> std::io::Result<fs::File> {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let home = self.resolver.windows_home();
+        let home_handle = fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(home)?;
+        if home_handle.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WSL 用户目录不得是重解析点",
+            ));
+        }
+        let final_home = windows_final_path(&home_handle)?;
+        let config_root = self.resolver.client_config_root(client).windows;
+        let config_relative = config_root.strip_prefix(home).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Skill 客户端根目录不在固定 WSL 用户目录内",
+            )
+        })?;
+        let expected = final_home.join(config_relative).join(manifest_relative);
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(manifest)?;
+        if !file.metadata()?.is_file()
+            || !windows_paths_equal(&windows_final_path(&file)?, &expected)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Skill manifest 解析后不在固定目录或不是普通文件",
+            ));
+        }
+        Ok(file)
     }
 
     fn resolve(
@@ -108,8 +290,11 @@ impl LocalSkillTreeAdapter {
     }
 
     fn skill_relative(directory: &str) -> Result<String, LocalSkillTreeError> {
-        validate_skill_directory(directory).map_err(|error| {
-            LocalSkillTreeError::new(LocalSkillTreeErrorCode::InvalidPath, error.to_string())
+        validate_skill_directory(directory).map_err(|_| {
+            LocalSkillTreeError::new(
+                LocalSkillTreeErrorCode::InvalidPath,
+                "Skill 目录名不符合安全边界",
+            )
         })?;
         Ok(format!("skills/{directory}"))
     }
@@ -129,7 +314,7 @@ impl LocalSkillTreeAdapter {
         if !metadata.is_dir() {
             return Err(LocalSkillTreeError::new(
                 LocalSkillTreeErrorCode::InvalidTree,
-                format!("Skill 路径不是目录: {}", base.display()),
+                "Skill 路径不是目录",
             ));
         }
 
@@ -148,7 +333,7 @@ impl LocalSkillTreeAdapter {
         if !files.iter().any(|file| file.relative_path == "SKILL.md") {
             return Err(LocalSkillTreeError::new(
                 LocalSkillTreeErrorCode::InvalidTree,
-                format!("Skill 目录缺少 SKILL.md: {}", base.display()),
+                "Skill 目录缺少 SKILL.md",
             ));
         }
 
@@ -224,7 +409,7 @@ impl LocalSkillTreeAdapter {
             } else {
                 return Err(LocalSkillTreeError::new(
                     LocalSkillTreeErrorCode::InvalidTree,
-                    format!("Skill 包含不支持的文件类型: {}", guarded_path.display()),
+                    "Skill 包含不支持的文件类型",
                 ));
             }
         }
@@ -298,8 +483,8 @@ impl LocalSkillTreeAdapter {
             })?;
             fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
             self.resolve(client, &path_relative, WslPathAccess::Write)?;
-            crate::config::atomic_write(&path, &file.contents).map_err(|error| {
-                LocalSkillTreeError::new(LocalSkillTreeErrorCode::Io, error.to_string())
+            crate::config::atomic_write(&path, &file.contents).map_err(|_| {
+                LocalSkillTreeError::new(LocalSkillTreeErrorCode::Io, "Skill live 原子写入失败")
             })?;
         }
         Ok(base)
@@ -330,7 +515,7 @@ impl LocalSkillTreeAdapter {
             }
             Ok(_) => Err(LocalSkillTreeError::new(
                 LocalSkillTreeErrorCode::InvalidTree,
-                format!("Skill 目标不是目录: {}", path.display()),
+                "Skill 目标不是目录",
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(io_error(&path, error)),
@@ -353,7 +538,7 @@ impl LocalSkillTreeAdapter {
             Ok(_) => {
                 return Err(LocalSkillTreeError::new(
                     LocalSkillTreeErrorCode::InvalidTree,
-                    format!("Skill 目标不是目录: {}", target.display()),
+                    "Skill 目标不是目录",
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -407,7 +592,7 @@ impl LocalSkillTreeAdapter {
             } else {
                 return Err(LocalSkillTreeError::new(
                     LocalSkillTreeErrorCode::InvalidTree,
-                    format!("Skill 包含不支持的文件类型: {}", guarded_path.display()),
+                    "Skill 包含不支持的文件类型",
                 ));
             }
         }
@@ -448,7 +633,7 @@ impl LocalSkillTreeAdapter {
             } else if !metadata.is_file() {
                 return Err(LocalSkillTreeError::new(
                     LocalSkillTreeErrorCode::InvalidTree,
-                    format!("Skill 包含不支持的文件类型: {}", guarded_path.display()),
+                    "Skill 包含不支持的文件类型",
                 ));
             }
         }
@@ -463,11 +648,18 @@ impl Default for LocalSkillTreeAdapter {
 }
 
 impl LocalSkillTreePort for LocalSkillTreeAdapter {
-    fn scan(
+    fn list_directories(
         &self,
         client: ManagedClientId,
-    ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError> {
-        self.scan_candidates(client, false)
+    ) -> Result<Vec<LocalSkillDirectoryCandidate>, LocalSkillTreeError> {
+        self.list_safe_directories(client)
+    }
+
+    fn read_manifest(
+        &self,
+        candidate: &LocalSkillDirectoryCandidate,
+    ) -> Result<Option<Vec<u8>>, LocalSkillTreeError> {
+        self.read_manifest_only(candidate)
     }
 
     fn capture(
@@ -492,9 +684,9 @@ impl LocalSkillTreePort for LocalSkillTreeAdapter {
         if let Err(primary) = self.replace_without_snapshot(client, directory, tree) {
             return match self.restore(&original) {
                 Ok(()) => Err(primary),
-                Err(rollback) => Err(LocalSkillTreeError::new(
+                Err(_) => Err(LocalSkillTreeError::new(
                     LocalSkillTreeErrorCode::Io,
-                    format!("{primary}; Skill 回滚也失败: {rollback}"),
+                    format!("Skill live 替换与回滚失败: primary_kind={:?}", primary.code),
                 )),
             };
         }
@@ -599,10 +791,124 @@ fn validate_tree_relative(value: &str) -> Result<(), LocalSkillTreeError> {
     }
 }
 
+const MAX_MANIFEST_METADATA_BYTES: usize = 256 * 1024;
+
+fn read_manifest_metadata_prefix(file: &mut fs::File) -> std::io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(file);
+    let mut contents = Vec::new();
+    let first_start = read_bounded_line(&mut reader, &mut contents)?;
+    if trim_line_ending(&contents[first_start..]) != b"---" {
+        return Ok(contents);
+    }
+
+    loop {
+        let line_start = read_bounded_line(&mut reader, &mut contents)?;
+        if line_start == contents.len() || trim_line_ending(&contents[line_start..]) == b"---" {
+            return Ok(contents);
+        }
+    }
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, contents: &mut Vec<u8>) -> std::io::Result<usize> {
+    if contents.len() >= MAX_MANIFEST_METADATA_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Skill manifest 元数据超过 256 KiB",
+        ));
+    }
+    let start = contents.len();
+    reader
+        .take((MAX_MANIFEST_METADATA_BYTES - contents.len()) as u64)
+        .read_until(b'\n', contents)?;
+    if contents.len() == MAX_MANIFEST_METADATA_BYTES && !contents[start..].ends_with(b"\n") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Skill manifest 元数据超过 256 KiB",
+        ));
+    }
+    Ok(start)
+}
+
+fn trim_line_ending(mut value: &[u8]) -> &[u8] {
+    if value.ends_with(b"\n") {
+        value = &value[..value.len() - 1];
+    }
+    if value.ends_with(b"\r") {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(windows)]
+fn windows_final_path(file: &fs::File) -> std::io::Result<PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+
+    let handle = file.as_raw_handle() as HANDLE;
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(written as usize);
+    let value = String::from_utf16(&buffer)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(PathBuf::from(
+        value
+            .strip_prefix(r"\\?\UNC\")
+            .map(|suffix| format!(r"\\{suffix}"))
+            .or_else(|| value.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(value),
+    ))
+}
+
+#[cfg(windows)]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy().replace('/', "\\") == right.to_string_lossy().replace('/', "\\")
+}
+
 fn hash_tree(directories: &[String], files: &[LocalSkillFile]) -> String {
-    let mut directories = directories.to_vec();
+    let mut directories: Vec<_> = directories.iter().map(String::as_str).collect();
     directories.sort();
-    let mut files = files.to_vec();
+    let mut files: Vec<_> = files.iter().collect();
     files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let mut hasher = Sha256::new();
     for directory in directories {
@@ -629,13 +935,16 @@ fn map_path_error(error: WslPathError) -> LocalSkillTreeError {
         | WslPathErrorCode::PathEscape => LocalSkillTreeErrorCode::InvalidPath,
         WslPathErrorCode::InspectionFailed => LocalSkillTreeErrorCode::Io,
     };
-    LocalSkillTreeError::new(code, error.to_string())
+    LocalSkillTreeError::new(
+        code,
+        format!("Skill live 路径校验失败: kind={:?}", error.code),
+    )
 }
 
-fn io_error(path: &Path, error: std::io::Error) -> LocalSkillTreeError {
+fn io_error(_path: &Path, error: std::io::Error) -> LocalSkillTreeError {
     LocalSkillTreeError::new(
         LocalSkillTreeErrorCode::Io,
-        format!("{}: {error}", path.display()),
+        format!("Skill live 文件树 I/O 失败: kind={:?}", error.kind()),
     )
 }
 
@@ -759,6 +1068,158 @@ mod tests {
         assert!(!copied.join(".git").exists());
         assert!(!copied.join("node_modules").exists());
         assert!(!copied.join("partial.tmp").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn manual_scan_reports_an_inaccessible_fixed_home_instead_of_an_empty_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-home");
+        let _home = TestHomeGuard::set(&missing);
+        let adapter = LocalSkillTreeAdapter::runtime();
+
+        let error = adapter
+            .list_directories(ManagedClientId::Claude)
+            .expect_err("an inaccessible fixed home must not look like an empty skills root");
+
+        assert_eq!(error.code, LocalSkillTreeErrorCode::Io);
+    }
+
+    #[test]
+    #[serial]
+    fn manual_scan_treats_a_missing_skills_root_as_an_empty_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHomeGuard::set(temp.path());
+        let adapter = LocalSkillTreeAdapter::runtime();
+
+        let candidates = adapter
+            .list_directories(ManagedClientId::Claude)
+            .expect("an accessible home with no skills root is an empty client");
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn manifest_discovery_reads_only_the_front_matter_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SKILL.md");
+        fs::write(
+            &path,
+            [
+                b"---\nname: bounded\ndescription: preview\n---\n".as_slice(),
+                &vec![b'x'; MAX_MANIFEST_METADATA_BYTES],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let mut file = fs::File::open(path).unwrap();
+
+        assert_eq!(
+            read_manifest_metadata_prefix(&mut file).unwrap(),
+            b"---\nname: bounded\ndescription: preview\n---\n"
+        );
+    }
+
+    #[test]
+    fn manifest_discovery_rejects_an_unbounded_front_matter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SKILL.md");
+        fs::write(
+            &path,
+            [
+                b"---\nname: ".as_slice(),
+                &vec![b'x'; MAX_MANIFEST_METADATA_BYTES],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let mut file = fs::File::open(path).unwrap();
+
+        assert_eq!(
+            read_manifest_metadata_prefix(&mut file).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn hash_tree_matches_the_v1_protocol_golden_value_and_ignores_input_order() {
+        let skill = LocalSkillFile {
+            relative_path: "SKILL.md".to_string(),
+            contents: b"---\nname: Golden\n---\n".to_vec(),
+        };
+        let data = LocalSkillFile {
+            relative_path: "assets/data.bin".to_string(),
+            contents: vec![0, 1, 2, 255],
+        };
+        let directories = vec!["empty".to_string(), "assets".to_string()];
+        let files = vec![data.clone(), skill.clone()];
+
+        assert_eq!(
+            hash_tree(&directories, &files),
+            "e2756857e34c5eafc94f16762f1f3741156848918c4dcf5a3c8b83aac8a9e6b4"
+        );
+        assert_eq!(
+            hash_tree(&directories, &files),
+            hash_tree(&["assets".to_string(), "empty".to_string()], &[skill, data])
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn manual_scan_reads_only_manifest_while_strict_scan_captures_the_full_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHomeGuard::set(temp.path());
+        let source = temp.path().join(".claude/skills/example");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("SKILL.md"), b"---\nname: example\n---\n").unwrap();
+        fs::write(source.join("nested/data.bin"), vec![7_u8; 1024]).unwrap();
+        let adapter = LocalSkillTreeAdapter::runtime();
+
+        let candidates = adapter.list_directories(ManagedClientId::Claude).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            adapter.read_manifest(&candidates[0]).unwrap().unwrap(),
+            b"---\nname: example\n---\n"
+        );
+
+        let strict = adapter.scan_strict(ManagedClientId::Claude).unwrap();
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].tree.file_count, 2);
+        assert_eq!(strict[0].tree.file("nested/data.bin").unwrap().len(), 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn manual_scan_lists_linked_entries_but_guarded_manifest_reads_reject_them() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = TestHomeGuard::set(temp.path());
+        let root = temp.path().join(".claude/skills");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), b"---\nname: outside\n---\n").unwrap();
+        symlink(&outside, root.join("linked-directory")).unwrap();
+        fs::create_dir_all(root.join("linked-manifest")).unwrap();
+        symlink(
+            outside.join("SKILL.md"),
+            root.join("linked-manifest/SKILL.md"),
+        )
+        .unwrap();
+        let adapter = LocalSkillTreeAdapter::runtime();
+
+        let candidates = adapter.list_directories(ManagedClientId::Claude).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].directory, "linked-directory");
+        assert_eq!(candidates[1].directory, "linked-manifest");
+        for candidate in &candidates {
+            assert_eq!(
+                adapter.read_manifest(candidate).unwrap_err().code,
+                LocalSkillTreeErrorCode::LinkNotAllowed
+            );
+        }
     }
 
     #[test]

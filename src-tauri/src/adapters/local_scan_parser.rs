@@ -1,19 +1,22 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::adapters::live_provider_config::runtime_adapter;
+use crate::adapters::local_scan_summary::DatabaseManagedSkillInventory;
 use crate::adapters::local_skill_tree::LocalSkillTreeAdapter;
 use crate::adapters::mcp_live_files::McpLiveFileAdapter;
 use crate::adapters::prompt_live_file::PromptLiveFileAdapter;
 use crate::app_config::MultiAppConfig;
+use crate::database::Database;
 use crate::domain::{
     validate_server_spec, LocalScanDomain, LocalScanFailureKind, LocalScanTarget, ManagedClientId,
 };
 use crate::ports::{
     LiveProviderConfigErrorCode, LocalScanParsedRecord, LocalScanParsedSnapshot,
-    LocalScanParserPort, LocalScanReadFailure, LocalSkillTree,
+    LocalScanParserPort, LocalScanReadFailure, LocalSkillTree, ManagedSkillInventoryPort,
 };
 
 /// Dispatches to four independent full parsers after the summary layer proves a
@@ -157,6 +160,91 @@ impl LocalScanParserPort for FixedLocalScanParserAdapter {
             LocalScanDomain::Mcp => self.parse_mcp(target),
             LocalScanDomain::Prompt => self.parse_prompt(target),
             LocalScanDomain::Skill => self.parse_skills(target),
+        }
+    }
+}
+
+/// Production composite paired with `DatabaseLocalScanSummaryAdapter`. It uses
+/// the exact managed inventory cached by the summary read and never enumerates
+/// unknown Skill directories.
+pub struct DatabaseLocalScanParserAdapter {
+    fixed: FixedLocalScanParserAdapter,
+    inventory: Arc<dyn ManagedSkillInventoryPort>,
+    refresh_before_skill_parse: bool,
+    skills: LocalSkillTreeAdapter,
+}
+
+impl DatabaseLocalScanParserAdapter {
+    pub fn new(inventory: Arc<dyn ManagedSkillInventoryPort>) -> Self {
+        Self {
+            fixed: FixedLocalScanParserAdapter::runtime(),
+            inventory,
+            refresh_before_skill_parse: false,
+            skills: LocalSkillTreeAdapter::runtime(),
+        }
+    }
+
+    /// Standalone DB-aware parser for production paths that are not paired with
+    /// a preceding summary observation (for example conflict validation).
+    pub fn runtime(database: Arc<Database>) -> Self {
+        Self {
+            fixed: FixedLocalScanParserAdapter::runtime(),
+            inventory: Arc::new(DatabaseManagedSkillInventory::new(database)),
+            refresh_before_skill_parse: true,
+            skills: LocalSkillTreeAdapter::runtime(),
+        }
+    }
+
+    fn parse_managed_skills(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanParsedSnapshot, LocalScanReadFailure> {
+        let records = if self.refresh_before_skill_parse {
+            self.inventory.refresh_managed_skills(target.client_id)?
+        } else {
+            self.inventory.list_managed_skills(target.client_id)?
+        };
+        let directories: HashSet<_> = records
+            .iter()
+            .map(|skill| skill.directory.clone())
+            .collect();
+        if directories.len() != records.len() {
+            return Err(parse_failure(None));
+        }
+        let candidates = self
+            .skills
+            .scan_managed(target.client_id, directories)
+            .map_err(|_| parse_failure(None))?;
+        let mut parsed = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let (name, description) =
+                parse_skill_metadata(&candidate.tree, &candidate.directory)
+                    .map_err(|_| parse_failure(Some(candidate.directory.as_str())))?;
+            parsed.push(parsed_record(
+                &candidate.directory,
+                json!({
+                    "name": name,
+                    "description": description,
+                    "contentHash": candidate.tree.content_hash,
+                    "totalSizeBytes": candidate.tree.total_size_bytes,
+                    "fileCount": candidate.tree.file_count,
+                    "cloudEligible": candidate.tree.is_cloud_eligible(),
+                }),
+            )?);
+        }
+        parsed_snapshot(target, parsed)
+    }
+}
+
+impl LocalScanParserPort for DatabaseLocalScanParserAdapter {
+    fn parse_changed(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanParsedSnapshot, LocalScanReadFailure> {
+        if target.domain == LocalScanDomain::Skill {
+            self.parse_managed_skills(target)
+        } else {
+            self.fixed.parse_changed(target)
         }
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -42,11 +44,16 @@ fn summary(scan_target: LocalScanTarget, generation: u64) -> LocalScanSummary {
 #[derive(Default)]
 struct MutableSummarySource {
     summaries: Mutex<HashMap<LocalScanTarget, LocalScanSummary>>,
+    expected: Mutex<HashMap<LocalScanTarget, LocalScanSummary>>,
 }
 
 impl MutableSummarySource {
     fn set(&self, value: LocalScanSummary) {
         self.summaries.lock().unwrap().insert(value.target, value);
+    }
+
+    fn set_expected(&self, value: LocalScanSummary) {
+        self.expected.lock().unwrap().insert(value.target, value);
     }
 
     fn remove(&self, target: LocalScanTarget) {
@@ -68,6 +75,88 @@ impl LocalScanSummaryPort for MutableSummarySource {
                 kind: LocalScanFailureKind::NotFound,
                 record_id: None,
             })
+    }
+
+    fn expected_after_write(
+        &self,
+        scan_target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        if let Some(summary) = self.expected.lock().unwrap().get(&scan_target).cloned() {
+            Ok(summary)
+        } else {
+            self.scan_summary(scan_target)
+        }
+    }
+}
+
+struct BlockingSummarySource {
+    inner: Arc<MutableSummarySource>,
+    reads: AtomicUsize,
+    block_next: AtomicBool,
+    block_state: Mutex<(bool, bool)>,
+    block_changed: Condvar,
+}
+
+impl BlockingSummarySource {
+    fn new(inner: Arc<MutableSummarySource>) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            block_next: AtomicBool::new(false),
+            block_state: Mutex::new((false, false)),
+            block_changed: Condvar::new(),
+        }
+    }
+
+    fn block_next_read(&self) {
+        *self.block_state.lock().unwrap() = (false, false);
+        self.block_next.store(true, Ordering::Release);
+    }
+
+    fn wait_until_blocked(&self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut state = self.block_state.lock().unwrap();
+        while !state.0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "summary read did not block in time");
+            let (next, timeout) = self.block_changed.wait_timeout(state, remaining).unwrap();
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.0,
+                "summary read did not block in time"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.block_state.lock().unwrap();
+        state.1 = true;
+        self.block_changed.notify_all();
+    }
+}
+
+impl LocalScanSummaryPort for BlockingSummarySource {
+    fn scan_summary(
+        &self,
+        scan_target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        self.reads.fetch_add(1, Ordering::AcqRel);
+        if self.block_next.swap(false, Ordering::AcqRel) {
+            let mut state = self.block_state.lock().unwrap();
+            state.0 = true;
+            self.block_changed.notify_all();
+            while !state.1 {
+                state = self.block_changed.wait(state).unwrap();
+            }
+        }
+        self.inner.scan_summary(scan_target)
+    }
+
+    fn expected_after_write(
+        &self,
+        scan_target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        self.inner.expected_after_write(scan_target)
     }
 }
 
@@ -177,6 +266,154 @@ fn post_commit_registration_expands_shared_files_deduplicates_and_fails_closed()
     assert!(failed.is_empty());
     assert_eq!(writes.pending_count(), 3);
     assert_eq!(writes.last_generation(), 3);
+}
+
+#[test]
+fn write_registration_uses_projected_expected_state_not_an_immediate_live_rescan() {
+    let scan_target = target(LocalScanDomain::Skill, ManagedClientId::Claude);
+    let source = Arc::new(MutableSummarySource::default());
+    let parser = Arc::new(RecordingParser::default());
+    let writes = Arc::new(LocalScanWriteTracker::default());
+    source.set(summary(scan_target, 0));
+    let coordinator = coordinator(source.clone(), parser.clone(), writes.clone());
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::Unchanged { .. }
+    ));
+
+    let expected = summary(scan_target, 1);
+    let third_party = summary(scan_target, 2);
+    source.set_expected(expected);
+    source.set(third_party);
+    let registered = record_local_writes(&writes, source.as_ref(), [scan_target]);
+    assert_eq!(registered.len(), 1);
+
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::Changed { .. }
+    ));
+    assert_eq!(parser.calls.lock().unwrap().as_slice(), &[scan_target]);
+    assert!(coordinator.pending_change(scan_target).is_some());
+    assert_eq!(writes.pending_count(), 0);
+}
+
+#[test]
+fn late_matching_write_expectation_clears_stale_pending_then_detects_third_party_change() {
+    let scan_target = target(LocalScanDomain::Skill, ManagedClientId::Claude);
+    let source = Arc::new(MutableSummarySource::default());
+    let parser = Arc::new(RecordingParser::default());
+    let writes = Arc::new(LocalScanWriteTracker::default());
+    source.set(summary(scan_target, 0));
+    let coordinator = coordinator(source.clone(), parser.clone(), writes.clone());
+    coordinator.rescan_target(scan_target);
+
+    let written = summary(scan_target, 1);
+    source.set(written.clone());
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::Changed { .. }
+    ));
+    assert!(coordinator.pending_change(scan_target).is_some());
+
+    source.set_expected(written);
+    let registered = record_local_writes(&writes, source.as_ref(), [scan_target]);
+    assert_eq!(registered.len(), 1);
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::SelfWriteSuppressed {
+            write_generation: 1,
+            ..
+        }
+    ));
+    assert!(coordinator.pending_change(scan_target).is_none());
+    assert_eq!(writes.pending_count(), 0);
+
+    source.set(summary(scan_target, 2));
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::Changed { .. }
+    ));
+    assert!(coordinator.pending_change(scan_target).is_some());
+    assert_eq!(
+        parser.calls.lock().unwrap().as_slice(),
+        &[scan_target, scan_target]
+    );
+}
+
+#[test]
+fn authoritative_restart_discards_a_stale_write_expectation() {
+    let scan_target = target(LocalScanDomain::Skill, ManagedClientId::Claude);
+    let source = Arc::new(MutableSummarySource::default());
+    let parser = Arc::new(RecordingParser::default());
+    let writes = Arc::new(LocalScanWriteTracker::default());
+    source.set(summary(scan_target, 0));
+    let coordinator = coordinator(source.clone(), parser.clone(), writes.clone());
+    coordinator.rescan_target(scan_target);
+
+    let stale_expected = summary(scan_target, 1);
+    assert_eq!(writes.record_expected(&stale_expected).unwrap(), 1);
+    source.set(summary(scan_target, 2));
+    assert!(matches!(
+        coordinator.restart_target_observation(scan_target),
+        LocalScanEvent::Unchanged { .. }
+    ));
+    assert_eq!(writes.pending_count(), 0);
+
+    source.set(stale_expected);
+    assert!(matches!(
+        coordinator.rescan_target(scan_target),
+        LocalScanEvent::Changed { .. }
+    ));
+    assert_eq!(parser.calls.lock().unwrap().as_slice(), &[scan_target]);
+}
+
+#[test]
+fn busy_authoritative_restart_is_queued_without_waiting_for_the_active_read() {
+    let scan_target = target(LocalScanDomain::Skill, ManagedClientId::Codex);
+    let inner = Arc::new(MutableSummarySource::default());
+    inner.set(summary(scan_target, 0));
+    let source = Arc::new(BlockingSummarySource::new(inner.clone()));
+    let parser = Arc::new(RecordingParser::default());
+    let writes = Arc::new(LocalScanWriteTracker::default());
+    let coordinator = Arc::new(LocalScanCoordinator::new(
+        source.clone(),
+        parser.clone(),
+        writes,
+    ));
+    coordinator.rescan_target(scan_target);
+
+    inner.set(summary(scan_target, 1));
+    source.block_next_read();
+    let active = {
+        let coordinator = coordinator.clone();
+        std::thread::spawn(move || coordinator.rescan_target(scan_target))
+    };
+    source.wait_until_blocked();
+
+    let started = Instant::now();
+    assert!(matches!(
+        coordinator.restart_target_observation(scan_target),
+        LocalScanEvent::Failed {
+            failure: wsl_code_switch_lib::domain::LocalScanFailure {
+                kind: LocalScanFailureKind::ReadFailed,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "restart must not wait behind an active UNC read"
+    );
+
+    source.release();
+    assert!(matches!(
+        active.join().unwrap(),
+        LocalScanEvent::Unchanged { .. }
+    ));
+    assert_eq!(source.reads.load(Ordering::Acquire), 3);
+    assert!(coordinator.pending_change(scan_target).is_none());
+    assert_eq!(parser.calls.lock().unwrap().as_slice(), &[scan_target]);
 }
 
 #[test]

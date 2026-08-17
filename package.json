@@ -1,6 +1,6 @@
 {
   "name": "wsl-code-switch",
-  "version": "3.19.4",
+  "version": "3.19.5",
   "description": "Windows manager for Claude Code, Codex and OpenCode in WSL Ubuntu",
   "type": "module",
   "scripts": {

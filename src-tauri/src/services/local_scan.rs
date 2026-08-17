@@ -1,17 +1,22 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
-use crate::adapters::local_scan_summary::FixedLocalScanSummaryAdapter;
+use crate::adapters::local_scan_summary::{
+    DatabaseLocalScanSummaryAdapter, FixedLocalScanSummaryAdapter,
+};
+use crate::database::Database;
 use crate::domain::{
     classify_local_reconciliation, compare_local_scan_summaries, DomainError, DomainErrorCode,
     LocalReconciliationBatch, LocalReconciliationExternal, LocalReconciliationInput,
     LocalReconciliationRecord, LocalReconciliationSnapshot, LocalScanDomain, LocalScanEvent,
-    LocalScanFailureKind, LocalScanSummary, LocalScanTarget, ManagedClientId,
+    LocalScanFailureKind, LocalScanRecordChange, LocalScanSummary, LocalScanTarget,
+    ManagedClientId,
 };
 use crate::ports::{
     LocalReconciliationStatePort, LocalScanParsedSnapshot, LocalScanParserPort,
@@ -207,18 +212,18 @@ impl LocalScanWriteTracker {
             .last_generation
     }
 
-    fn consume_matching_unchanged(&self, summary: &LocalScanSummary) {
+    fn consume_matching_unchanged(&self, summary: &LocalScanSummary) -> Option<u64> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
+        let generation = state
             .expected
             .get(&summary.target)
-            .is_some_and(|expected| expected.summary.scope_digest == summary.scope_digest)
-        {
-            state.expected.remove(&summary.target);
-        }
+            .filter(|expected| expected.summary.scope_digest == summary.scope_digest)
+            .map(|expected| expected.generation)?;
+        state.expected.remove(&summary.target);
+        Some(generation)
     }
 
     fn resolve_changed(&self, summary: &LocalScanSummary) -> Option<u64> {
@@ -228,6 +233,20 @@ impl LocalScanWriteTracker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected = state.expected.remove(&summary.target)?;
         (expected.summary.scope_digest == summary.scope_digest).then_some(expected.generation)
+    }
+
+    fn discard_through(&self, target: LocalScanTarget, generation: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .expected
+            .get(&target)
+            .is_some_and(|expected| expected.generation <= generation)
+        {
+            state.expected.remove(&target);
+        }
     }
 }
 
@@ -270,7 +289,7 @@ pub fn record_local_writes(
 
     let mut registrations = Vec::with_capacity(expanded.len());
     for target in expanded {
-        let summary = match source.scan_summary(target) {
+        let summary = match source.expected_after_write(target) {
             Ok(summary) if summary.target == target => summary,
             Ok(_) => {
                 log::warn!(
@@ -312,6 +331,18 @@ pub fn record_runtime_local_writes(
     record_local_writes(tracker, &FixedLocalScanSummaryAdapter::runtime(), targets)
 }
 
+/// DB-aware post-write registration for callers that may include Skill targets.
+/// Existing non-Skill callers can keep the fixed helper; Skill and synchronized
+/// local-apply paths should pass their application database here.
+pub fn record_database_local_writes(
+    tracker: &LocalScanWriteTracker,
+    database: Arc<Database>,
+    targets: impl IntoIterator<Item = LocalScanTarget>,
+) -> Vec<LocalScanWriteRegistration> {
+    let (source, _) = DatabaseLocalScanSummaryAdapter::runtime(database);
+    record_local_writes(tracker, &source, targets)
+}
+
 fn push_unique_target(
     targets: &mut Vec<LocalScanTarget>,
     seen: &mut HashSet<LocalScanTarget>,
@@ -327,6 +358,8 @@ pub struct LocalScanCoordinator {
     source: Arc<dyn LocalScanSummaryPort>,
     parser: Arc<dyn LocalScanParserPort>,
     writes: Arc<LocalScanWriteTracker>,
+    observe_gates: Mutex<HashMap<LocalScanTarget, Arc<Mutex<()>>>>,
+    restart_requested: Mutex<HashSet<LocalScanTarget>>,
     previous: Mutex<HashMap<LocalScanTarget, LocalScanSummary>>,
     pending: Mutex<HashMap<LocalScanTarget, LocalScanParsedChange>>,
     pending_failures: Mutex<HashMap<LocalScanTarget, LocalScanEvent>>,
@@ -342,6 +375,8 @@ impl LocalScanCoordinator {
             source,
             parser,
             writes,
+            observe_gates: Mutex::new(HashMap::new()),
+            restart_requested: Mutex::new(HashSet::new()),
             previous: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pending_failures: Mutex::new(HashMap::new()),
@@ -425,23 +460,122 @@ impl LocalScanCoordinator {
         self.observe(target)
     }
 
-    fn observe(&self, target: LocalScanTarget) -> LocalScanEvent {
-        let current = match self.source.scan_summary(target) {
-            Ok(summary) => summary,
-            Err(failure) => {
-                let event = failed_event(target, failure.kind, failure.record_id);
-                self.remember_failed(event.clone());
-                return event;
+    /// Rebuild one target from its persisted database baseline after an explicit
+    /// authoritative refresh. A busy target is reset and queued instead of
+    /// waiting behind a potentially wedged UNC read. The active observation
+    /// consumes that queue before releasing its gate.
+    pub fn restart_target_observation(&self, target: LocalScanTarget) -> LocalScanEvent {
+        let cutoff = self.writes.last_generation();
+        self.writes.discard_through(target, cutoff);
+        self.restart_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(target);
+
+        let gate = self.observation_gate(target);
+        let outcome = match gate.try_lock() {
+            Ok(observation) => self.observe_with_queued_restarts(target, observation),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.observe_with_queued_restarts(target, poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                failed_event(target, LocalScanFailureKind::ReadFailed, None)
             }
         };
+        outcome
+    }
 
+    fn reset_target_observation(&self, target: LocalScanTarget) {
+        self.previous
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&target);
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&target);
+        self.pending_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&target);
+    }
+
+    fn observation_gate(&self, target: LocalScanTarget) -> Arc<Mutex<()>> {
+        self.observe_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(target)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn observe(&self, target: LocalScanTarget) -> LocalScanEvent {
+        let gate = self.observation_gate(target);
+        let observation = gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.observe_with_queued_restarts(target, observation)
+    }
+
+    fn observe_with_queued_restarts<'a>(
+        &self,
+        target: LocalScanTarget,
+        observation: MutexGuard<'a, ()>,
+    ) -> LocalScanEvent {
+        let mut event = None;
+        loop {
+            let mut restarts = self
+                .restart_requested
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if restarts.remove(&target) {
+                drop(restarts);
+                self.reset_target_observation(target);
+                event = Some(self.observe_locked(target));
+                continue;
+            }
+            if let Some(event) = event {
+                drop(observation);
+                drop(restarts);
+                return event;
+            }
+            drop(restarts);
+            event = Some(self.observe_locked(target));
+        }
+    }
+
+    fn observe_locked(&self, target: LocalScanTarget) -> LocalScanEvent {
         let prior = self
             .previous
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&target)
             .cloned();
-        let event = match prior.as_ref() {
+        let first = if prior.is_none() {
+            match self.source.scan_first_observation(target) {
+                Ok(first) => Some(first),
+                Err(failure) => {
+                    let event = failed_event(target, failure.kind, failure.record_id);
+                    self.remember_failed(event.clone());
+                    return event;
+                }
+            }
+        } else {
+            None
+        };
+        let current = match first.as_ref() {
+            Some(first) => first.current.clone(),
+            None => match self.source.scan_summary(target) {
+                Ok(summary) => summary,
+                Err(failure) => {
+                    let event = failed_event(target, failure.kind, failure.record_id);
+                    self.remember_failed(event.clone());
+                    return event;
+                }
+            },
+        };
+
+        let event = match prior.as_ref().or_else(|| first.as_ref()?.baseline.as_ref()) {
             Some(prior) => compare_local_scan_summaries(prior, &current)
                 .unwrap_or_else(|_| failed_event(target, LocalScanFailureKind::DigestFailed, None)),
             None => LocalScanEvent::Unchanged {
@@ -449,13 +583,35 @@ impl LocalScanCoordinator {
                 scope_digest: current.scope_digest.clone(),
             },
         };
+        let must_parse_first = first.as_ref().is_some_and(|first| first.requires_parse);
+        let event = if must_parse_first && matches!(event, LocalScanEvent::Unchanged { .. }) {
+            forced_changed_event(&current)
+        } else {
+            event
+        };
 
         match event {
             LocalScanEvent::Unchanged { .. } => {
-                self.writes.consume_matching_unchanged(&current);
-                self.clear_recovered_failure(target);
-                self.remember(current);
-                event
+                if let Some(write_generation) = self.writes.consume_matching_unchanged(&current) {
+                    self.pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&target);
+                    self.pending_failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&target);
+                    self.remember(current.clone());
+                    LocalScanEvent::SelfWriteSuppressed {
+                        target,
+                        scope_digest: current.scope_digest,
+                        write_generation,
+                    }
+                } else {
+                    self.clear_recovered_failure(target);
+                    self.remember(current);
+                    event
+                }
             }
             LocalScanEvent::Changed { .. } => {
                 self.pending
@@ -533,6 +689,20 @@ impl LocalScanCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(summary.target, summary);
+    }
+}
+
+fn forced_changed_event(current: &LocalScanSummary) -> LocalScanEvent {
+    LocalScanEvent::Changed {
+        target: current.target,
+        previous_scope_digest: "0".repeat(64),
+        current_scope_digest: current.scope_digest.clone(),
+        records: current
+            .entries
+            .iter()
+            .cloned()
+            .map(|current| LocalScanRecordChange::Added { current })
+            .collect(),
     }
 }
 
@@ -662,6 +832,7 @@ impl LocalScanScheduler {
             },
             degraded: false,
             last_duration: Duration::ZERO,
+            scan_in_flight: Arc::new(AtomicBool::new(false)),
             commands: receiver,
         };
         (Self { commands }, worker)
@@ -690,6 +861,14 @@ impl LocalScanScheduler {
     }
 }
 
+struct ScanInFlightReset(Arc<AtomicBool>);
+
+impl Drop for ScanInFlightReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub struct LocalScanWorker {
     executor: Arc<dyn LocalScanExecutor>,
     cadence: LocalScanCadence,
@@ -700,6 +879,9 @@ pub struct LocalScanWorker {
     /// Duration of the most recent scan cycle. The next rest is never shorter
     /// than this, so slow UNC reads cannot keep the bridge saturated.
     last_duration: Duration,
+    /// Remains true until the blocking read actually exits, even if the async
+    /// deadline already returned. Timed-out cycles never enqueue another reader.
+    scan_in_flight: Arc<AtomicBool>,
     commands: mpsc::UnboundedReceiver<LocalScanCommand>,
 }
 
@@ -762,20 +944,30 @@ impl LocalScanWorker {
     }
 
     /// Runs one scan cycle and reports whether every target succeeded.
-    /// Runs one scan cycle and reports whether every target succeeded.
     ///
-    /// A wedged WSL UNC channel can park a blocking read forever; the cycle
-    /// deadline cuts those off so the scheduler keeps pacing and page-enter
-    /// commands keep being served instead of queueing behind a dead scan.
-    /// The bound covers real-world slow cycles (observed up to ~110s over
-    /// degraded UNC) while still bounding a fully wedged channel in minutes.
+    /// A wedged WSL UNC channel can park a blocking read forever. The async
+    /// deadline keeps scheduler commands responsive, while `scan_in_flight`
+    /// prevents later cycles from accumulating more uncancellable readers.
     async fn execute(&mut self, domains: Vec<LocalScanDomain>) -> bool {
         let deadline = self.cadence.background * 4;
+        if self
+            .scan_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            log::warn!("上一轮本地摘要扫描仍在运行，跳过本轮以避免积压");
+            self.last_duration = Duration::ZERO;
+            return false;
+        }
         let executor = self.executor.clone();
+        let in_flight = self.scan_in_flight.clone();
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             deadline,
-            tokio::task::spawn_blocking(move || executor.scan_domains(&domains)),
+            tokio::task::spawn_blocking(move || {
+                let _reset = ScanInFlightReset(in_flight);
+                executor.scan_domains(&domains)
+            }),
         )
         .await;
         self.last_duration = started.elapsed();
@@ -803,5 +995,42 @@ impl LocalScanWorker {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target() -> LocalScanTarget {
+        LocalScanTarget {
+            domain: LocalScanDomain::Skill,
+            client_id: ManagedClientId::Claude,
+        }
+    }
+
+    fn summary(generation: u64) -> LocalScanSummary {
+        LocalScanSummary::new(
+            target(),
+            format!(
+                "{:x}",
+                Sha256::digest(format!("scope-{generation}").as_bytes())
+            ),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restart_cutoff_never_discards_a_newer_expectation() {
+        let tracker = LocalScanWriteTracker::default();
+        assert_eq!(tracker.record_expected(&summary(1)).unwrap(), 1);
+        let cutoff = tracker.last_generation();
+        assert_eq!(tracker.record_expected(&summary(2)).unwrap(), 2);
+
+        tracker.discard_through(target(), cutoff);
+
+        assert_eq!(tracker.pending_count(), 1);
+        assert_eq!(tracker.resolve_changed(&summary(2)), Some(2));
     }
 }

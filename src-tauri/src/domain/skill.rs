@@ -142,15 +142,6 @@ impl LocalSkillImport {
     }
 }
 
-/// One live copy of an unmanaged Skill: where it was found and its content
-/// digest, so import defaults can preselect hash-identical targets.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnmanagedSkillCopy {
-    pub client: ManagedClientId,
-    pub content_hash: String,
-}
-
 /// One safe, importable live Skill found outside the managed database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -160,9 +151,34 @@ pub struct UnmanagedLocalSkill {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub found_in: Vec<ManagedClientId>,
-    /// Per-client live content digests, aligned with `found_in` ordering.
-    pub copies: Vec<UnmanagedSkillCopy>,
-    pub path: String,
+}
+
+/// A live-copy problem that prevented one managed Skill from being refreshed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalSkillScanIssueKind {
+    DivergentCopies,
+    InvalidCopy,
+    CaseCollision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSkillScanIssue {
+    pub directory: String,
+    pub clients: Vec<ManagedClientId>,
+    pub kind: LocalSkillScanIssueKind,
+}
+
+/// Combined local-authority refresh and unmanaged discovery result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSkillScanResult {
+    pub installed: Vec<LocalSkill>,
+    pub unmanaged: Vec<UnmanagedLocalSkill>,
+    pub issues: Vec<LocalSkillScanIssue>,
+    pub updated_count: u64,
+    pub removed_count: u64,
 }
 
 pub fn validate_skill_directory(value: &str) -> Result<(), DomainError> {
@@ -300,6 +316,45 @@ mod tests {
         let mut invalid = valid_import();
         invalid.apps = ManagedClientApps::only(ManagedClientId::Codex);
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn local_scan_contract_uses_camel_case_fields_and_stable_snake_case_issue_kinds() {
+        let result = LocalSkillScanResult {
+            installed: Vec::new(),
+            unmanaged: vec![UnmanagedLocalSkill {
+                directory: "unmanaged".to_string(),
+                name: "Unmanaged".to_string(),
+                description: None,
+                found_in: vec![ManagedClientId::Codex],
+            }],
+            issues: vec![LocalSkillScanIssue {
+                directory: "fixture".to_string(),
+                clients: vec![ManagedClientId::Claude],
+                kind: LocalSkillScanIssueKind::DivergentCopies,
+            }],
+            updated_count: 2,
+            removed_count: 1,
+        };
+
+        assert_eq!(
+            serde_json::to_value(result).expect("serialize scan result"),
+            serde_json::json!({
+                "installed": [],
+                "unmanaged": [{
+                    "directory": "unmanaged",
+                    "name": "Unmanaged",
+                    "foundIn": ["codex"]
+                }],
+                "issues": [{
+                    "directory": "fixture",
+                    "clients": ["claude"],
+                    "kind": "divergent_copies"
+                }],
+                "updatedCount": 2,
+                "removedCount": 1
+            })
+        );
     }
 
     #[test]

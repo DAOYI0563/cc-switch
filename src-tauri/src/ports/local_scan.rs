@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::domain::{
     validate_local_scan_record_id, DomainError, DomainErrorCode, LocalReconciliationSnapshot,
-    LocalScanFailureKind, LocalScanSummary, LocalScanTarget,
+    LocalScanFailureKind, LocalScanSummary, LocalScanTarget, LocalSkill,
 };
 
 /// Redacted failure returned by a local summary source.
@@ -16,12 +16,59 @@ pub struct LocalScanReadFailure {
     pub record_id: Option<String>,
 }
 
+/// One atomic first observation. Database-aware sources can compare the live
+/// Skill scope with a persisted expected summary instead of treating process
+/// startup as an implicit confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalScanFirstObservation {
+    pub current: LocalScanSummary,
+    pub baseline: Option<LocalScanSummary>,
+    pub requires_parse: bool,
+}
+
+/// Read-only inventory of managed Skill records. Production uses the database;
+/// tests may replace it to exercise fail-closed behavior without live writes.
+pub trait ManagedSkillInventoryPort: Send + Sync {
+    fn list_managed_skills(
+        &self,
+        client: crate::domain::ManagedClientId,
+    ) -> Result<Vec<LocalSkill>, LocalScanReadFailure>;
+
+    fn refresh_managed_skills(
+        &self,
+        client: crate::domain::ManagedClientId,
+    ) -> Result<Vec<LocalSkill>, LocalScanReadFailure> {
+        self.list_managed_skills(client)
+    }
+}
+
 /// Read-only source of content-free summaries for fixed WSL live targets.
 pub trait LocalScanSummaryPort: Send + Sync {
     fn scan_summary(
         &self,
         target: LocalScanTarget,
     ) -> Result<LocalScanSummary, LocalScanReadFailure>;
+
+    /// Expected summary immediately after an application-managed write. The
+    /// default remains a live read; database-aware adapters may project a
+    /// committed expected state so a following third-party edit is not absorbed.
+    fn expected_after_write(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        self.scan_summary(target)
+    }
+
+    fn scan_first_observation(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanFirstObservation, LocalScanReadFailure> {
+        Ok(LocalScanFirstObservation {
+            current: self.scan_summary(target)?,
+            baseline: None,
+            requires_parse: false,
+        })
+    }
 }
 
 /// Content-free application state used for three-way local reconciliation.

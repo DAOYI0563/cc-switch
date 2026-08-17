@@ -55,11 +55,31 @@ pub struct LocalSkillLiveCandidate {
     pub tree: LocalSkillTree,
 }
 
+/// One validly named first-level entry below a fixed client `skills` root.
+///
+/// Listing intentionally does not read `SKILL.md` or capture the directory
+/// tree. A candidate may still be a link or otherwise unsafe; guarded manifest
+/// reads and full capture classify those cases without hiding managed copies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSkillDirectoryCandidate {
+    pub client: ManagedClientId,
+    pub directory: String,
+    pub path: String,
+}
+
 pub trait LocalSkillTreePort {
-    fn scan(
+    fn list_directories(
         &self,
         client: ManagedClientId,
-    ) -> Result<Vec<LocalSkillLiveCandidate>, LocalSkillTreeError>;
+    ) -> Result<Vec<LocalSkillDirectoryCandidate>, LocalSkillTreeError>;
+
+    /// Read only the ordinary, non-link `SKILL.md` for a listed directory.
+    /// Missing manifests are returned as `None`; this method never captures the
+    /// rest of the tree and never computes a tree digest.
+    fn read_manifest(
+        &self,
+        candidate: &LocalSkillDirectoryCandidate,
+    ) -> Result<Option<Vec<u8>>, LocalSkillTreeError>;
 
     fn capture(
         &self,
@@ -88,6 +108,15 @@ pub trait LocalSkillRepository {
     fn save_local_skills(&self, skills: &[LocalSkill]) -> Result<(), LocalSkillRepositoryError>;
 
     fn delete_local_skill(&self, id: &str) -> Result<bool, LocalSkillRepositoryError>;
+
+    /// Atomically apply one local-authority index refresh and return the complete
+    /// post-transaction index. Implementations must not expose partial upserts or
+    /// deletes if any statement fails.
+    fn reconcile_local_skills(
+        &self,
+        upserts: &[LocalSkill],
+        removed_ids: &[String],
+    ) -> Result<Vec<LocalSkill>, LocalSkillRepositoryError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,11 +1,13 @@
 # Phase 5: 本地扫描和冲突中心
 
-> **Status**: Complete  
-> **Tasks**: 5/5 complete  
-> **Goal**: 稳定感知固定 WSL 配置被应用外部修改的事实，生成可审查的差异或冲突，并在用户确认前保持数据库与 live 配置零写。  
+> **Status**: Complete — Skill 本地索引刷新增量已验证<br>
+> **Tasks**: 5/5 基线完成；2026-08-17 Skill 增量阶段门已关闭<br>
+> **Goal**: 周期、启动、恢复和页面进入只读感知固定 WSL 配置外改；仅在用户点击 Skill“导入已有”后显式刷新 managed 数据库索引，任何扫描或索引刷新都不写 WSL。<br>
 > **S.U.P.E.R Focus**: U、P、R
 
 ## Task Checklist
+
+P5-01 至 P5-05 的 Notes 保留原阶段历史证据；本页末尾的 Skill 增量阶段门记录 2026-08-17 最终工作树的重新验证结果。
 
 - [x] **P5-01**: 定义统一扫描摘要和变化事件
   - Priority: P0
@@ -42,9 +44,25 @@
   - Acceptance: 冲突中心统一展示供应商、MCP、Prompts、Skills 和后续 WebDAV 冲突；单条冲突不阻塞无冲突记录，处理前创建临时 DPAPI 回滚点，成功即删、失败最多保留 3 份。
   - Notes: 新增版本化、可序列化且不携带原始配置的统一冲突中心合同，以稳定来源、领域、客户端、记录 ID、摘要、固定差异/冲突类型和可执行动作同时承载本地扫描及后续 WebDAV 记录；多个来源经端口合并、稳定排序并拒绝重复 ID。处理前重新读取当前列表并拒绝陈旧项或不支持动作，再捕获领域回滚载荷并交给现有 Windows DPAPI 临时回滚存储；成功立即删除回滚点，失败保留且沿用最多 3 份的固定上限。生产处理适配器覆盖 Provider、MCP、Prompt、Skill 的接受 WSL 外部值、保留本地值、删除和重试，逐条应用、提交后校验并只消费目标项；单条冲突或数据库投影失败不会隐藏或阻塞其他可处理记录。前端新增持久化冲突中心视图、5 秒前台查询、按来源/领域/客户端筛选、摘要和错误类别展示、明确确认及相关查询失效，四语文案和工具栏入口同步完成。纯合同 5/5、生产运行时 7/7、前端聚焦 5 files/22 tests、App 8/8、前端全量 114 files/722 tests、串行 Rust 库 2390 passed/5 ignored 及全部 integration、typecheck/format/fmt/check/全目标 Clippy/diff-check 均通过；Windows 原生 MSVC 进程在真实 `\\wsl.localhost\Ubuntu` 临时根完成运行时合同 7/7，并显式断言 live 临时目录未退回 Windows 本地。质量门同时修复备份保留逻辑在系统时钟回拨时可能删除刚创建备份的问题，以未来 `mtime` 稳定回归 26/26；Windows 本地编译镜像、目标缓存和 WSL 夹具均已清理。S.U.P.E.R 10/10。
 
+## Skill 本地索引刷新增量（2026-08-17）
+
+本次重新打开 Phase 5，用于修正 Skill managed 索引长期只由数据库驱动、无法在显式导入入口反映磁盘删除和元数据变化的问题。已确认语义如下：
+
+- 启动、恢复、进入页面、前台 5 秒和托盘后台 30 秒扫描仍然只读，只生成差异/冲突，不自动修改数据库或 WSL。
+- background Skill scan 只扫描 `core_skills` 已知目录，unknown 目录只在用户点击“导入已有”后扫描；fresh process 首轮以 `core_skills` 已确认内容哈希和 `apps` 为基线，检测停机期间的修改、删除和已知目录新增，未确认哈希强制解析。
+- 点击“导入已有”是显式本地索引刷新授权：先安全列出 Claude Code、Codex、OpenCode 三个固定 WSL Skill 根，刷新 managed 列表，再展示 unmanaged 候选；该动作不写、不复制、不覆盖 WSL。
+- 某端目录确认删除时关闭该端，三端均确认删除时移出 managed 索引；安全有效且内容一致的现存副本刷新 `name`、`description`、内容哈希、大小、文件数、云同步资格和 `apps`。
+- 多端副本内容分叉时保留 canonical 元数据，只按安全确认存在的副本刷新 `apps` 并显示冲突；目录重命名按“旧 managed 删除 + 新 unmanaged”处理，不猜测身份。
+- WSL home/固定根不可用必须在数据库变更前失败关闭；link/reparse、大小写别名、重复候选和 invalid copy 不得造成误删。无问题记录可继续刷新，但异常记录保持原 managed 状态。
+- 索引 upsert/delete 必须在单个 SQLite transaction 中提交；只有确有索引修改时才创建最多 3 个 DPAPI 加密临时回滚点，无变化纯扫描不创建。
+- 设计只借鉴 SkillManage“本地磁盘驱动索引刷新”的理念；仍固定三端和既定 WSL 根，不引入任意 Agent/路径、`.disabled` 或自动覆盖。
+
+最终工作树已完成 DB-known background scan、fresh-process confirmed hash 基线、显式 managed/unmanaged 扫描、删除/一致刷新/分叉/重命名/异常保护、SQLite transaction 和 DPAPI 临时回滚点接入。完整前端 43 文件/229 项、Rust 29 目标/381 项、严格 Clippy、格式、diff-check、真实 WSL UNC Skill 合同 1/1、Windows x64 便携构建、校验和及隔离启动烟测均通过；独立复核另修正了“数据库已提交但回滚点清理失败时不得向前端伪报扫描失败”的一致性边缘，并新增回归测试。
+
 ## Phase Gate
 
-- [x] All tasks above are checked off.
+- [x] 原 Phase 5 五项任务的既有基线已完成。
+- [x] 本次 Skill 本地索引刷新增量已完成自动化、Windows/WSL 隔离合同、回滚路径和便携构建验证，阶段门重新关闭。
 - [x] 四个本地领域共享扫描契约，但解析和归一化保持独立。
 - [x] 启动、恢复、页面、前台 5 秒和后台 30 秒触发行为均可取消并通过测试。
 - [x] 无变化扫描不做完整解析，扫描本身不写数据库或 WSL live 配置。
@@ -52,8 +70,12 @@
 - [x] 外部新增、修改、删除、双边修改、无基线删除和解析错误分类正确。
 - [x] 冲突记录保持原状，无冲突记录可以继续处理。
 - [x] 路径越界、link/reparse、循环和权限错误失败关闭并只产生脱敏诊断。
-- [x] Frontend、Rust、Windows 原生到 WSL UNC 阶段门全部通过。
-- [x] S.U.P.E.R review is 10/10 for every completed task.
+- [x] Frontend、Rust、Windows 原生到 WSL UNC 原阶段门全部通过。
+- [x] S.U.P.E.R review is 10/10 for every originally completed task.
+- [x] background Skill scan 只读取 DB-known 目录，fresh process 使用 confirmed hash，unknown 仅由“导入已有”枚举。
+- [x] 显式刷新已覆盖单端/全端删除、一致副本、内容分叉、重命名、home 不可用、link/reparse、大小写别名和 invalid copy 矩阵。
+- [x] 索引有修改才创建、无变化不创建最多 3 个 DPAPI 临时回滚点；SQLite 批次全有或全无且刷新过程 WSL 零写。
+- [x] 完整前端、Rust、Windows/WSL 隔离合同和便携构建质量门通过；最终产物元数据已按实际文件更新。
 
 ## Notes
 

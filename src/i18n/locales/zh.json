@@ -336,21 +336,40 @@
     "noInstalled": "暂无已安装的技能",
     "noInstalledDescription": "点击“导入已有”扫描 Claude Code、Codex 和 OpenCode 中的本地技能。",
     "import": "导入已有",
-    "importDescription": "默认只纳入明确选择的内容来源，不会覆盖其他客户端中的同名目录",
+    "importDescription": "默认纳入该技能已发现的全部客户端；已存在的同名副本均按原样接管，不会覆盖任何现有内容",
     "scanLoading": "正在扫描三套 WSL Skill 目录...",
     "scanFailed": "扫描已有 Skill 失败",
+    "scanFailedDescription": "请确认 WSL Ubuntu 可访问后重试。",
+    "scanInvalidResult": "扫描结果格式无效",
+    "scanResult": "扫描完成：更新 {{updatedCount}} 项，移除 {{removedCount}} 项，发现 {{issueCount}} 项冲突或异常。",
     "sourceClient": "内容来源",
     "importSuccess": "成功导入 {{count}} 个技能",
     "importSelected": "导入已选 ({{count}})",
     "noUnmanagedFound": "未发现需要导入的技能。所有技能已在 WSL Code Switch 统一管理中。",
+    "issueRemovalBlocked": "该技能存在冲突或异常，暂时不能删除",
+    "scanIssuesTitle": "扫描问题",
+    "scanIssuesDescription": "以下本地目录存在冲突或异常，未纳入可导入列表。",
+    "issues": {
+      "divergentCopies": {
+        "badge": "内容冲突",
+        "label": "技能副本内容冲突",
+        "tooltip": "{{clients}} 中的同名技能内容不一致，请先确认保留版本。"
+      },
+      "invalidCopy": {
+        "badge": "副本异常",
+        "label": "技能副本异常",
+        "tooltip": "{{clients}} 中存在无法读取或校验的技能副本。"
+      },
+      "caseCollision": {
+        "badge": "目录冲突",
+        "label": "技能目录大小写冲突",
+        "tooltip": "{{clients}} 中存在仅大小写不同的同名技能目录。"
+      }
+    },
     "localOnly": "仅本地",
     "localOnlyDescription": "该技能可在本地使用，但超出 WebDAV 云同步限制。",
     "metaFiles": "{{count}} 个文件",
     "metaUpdated": "更新于 {{date}}",
-    "importCopiesConsistent": "各副本内容一致",
-    "importCopiesConsistentTitle": "同名目录在各客户端中的内容完全一致，已默认全部启用。",
-    "importCopiesConflict": "副本内容不一致",
-    "importCopiesConflictTitle": "同名目录在各客户端中的内容不同；默认仅启用所选来源，点亮其他客户端前请先确认以哪份为准。",
     "uninstallConfirm": "确定要删除技能“{{name}}”吗？这将从所有已启用客户端移除内容；检测到外部修改时会停止删除。",
     "uninstallAffectList": "将删除以下 WSL 目录：",
     "detailOpen": "查看详情",

@@ -114,6 +114,95 @@ impl Database {
             .map(|affected| affected > 0)
             .map_err(|error| AppError::Database(error.to_string()))
     }
+
+    pub fn reconcile_core_skill_index(
+        &self,
+        upserts: &[LocalSkill],
+        removed_ids: &[String],
+    ) -> Result<Vec<LocalSkill>, AppError> {
+        for skill in upserts {
+            skill
+                .validate()
+                .map_err(|error| AppError::InvalidInput(error.to_string()))?;
+            checked_sqlite_u64(skill.total_size_bytes, "total_size_bytes")?;
+            checked_sqlite_u64(skill.file_count, "file_count")?;
+        }
+
+        let mut conn = lock_conn!(self.conn);
+        let transaction = conn
+            .transaction()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        for skill in upserts {
+            transaction
+                .execute(
+                    "INSERT INTO core_skills (
+                        id, name, description, directory, content_hash,
+                        total_size_bytes, file_count, enabled_claude, enabled_codex,
+                        enabled_opencode, cloud_eligible, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(id) DO UPDATE SET
+                        name = excluded.name,
+                        description = excluded.description,
+                        directory = excluded.directory,
+                        content_hash = excluded.content_hash,
+                        total_size_bytes = excluded.total_size_bytes,
+                        file_count = excluded.file_count,
+                        enabled_claude = excluded.enabled_claude,
+                        enabled_codex = excluded.enabled_codex,
+                        enabled_opencode = excluded.enabled_opencode,
+                        cloud_eligible = excluded.cloud_eligible,
+                        updated_at_ms = excluded.updated_at_ms",
+                    params![
+                        skill.id,
+                        skill.name,
+                        skill.description,
+                        skill.directory,
+                        skill.content_hash,
+                        checked_sqlite_u64(skill.total_size_bytes, "total_size_bytes")?,
+                        checked_sqlite_u64(skill.file_count, "file_count")?,
+                        skill.apps.claude,
+                        skill.apps.codex,
+                        skill.apps.opencode,
+                        skill.cloud_eligible,
+                        skill.created_at_ms,
+                        skill.updated_at_ms,
+                    ],
+                )
+                .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+        for id in removed_ids {
+            transaction
+                .execute("DELETE FROM core_skills WHERE id = ?1", [id])
+                .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+
+        let skills = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT id, name, description, directory, content_hash,
+                            total_size_bytes, file_count, enabled_claude, enabled_codex,
+                            enabled_opencode, cloud_eligible, created_at_ms, updated_at_ms
+                     FROM core_skills ORDER BY lower(name), id",
+                )
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            let rows = statement
+                .query_map([], local_skill_from_row)
+                .map_err(|error| AppError::Database(error.to_string()))?;
+            let mut skills = Vec::new();
+            for row in rows {
+                let skill = row.map_err(|error| AppError::Database(error.to_string()))?;
+                skill.validate().map_err(|error| {
+                    AppError::Database(format!("core_skills 记录无效: {error}"))
+                })?;
+                skills.push(skill);
+            }
+            skills
+        };
+        transaction
+            .commit()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        Ok(skills)
+    }
 }
 
 impl LocalSkillRepository for Database {
@@ -131,6 +220,15 @@ impl LocalSkillRepository for Database {
 
     fn delete_local_skill(&self, id: &str) -> Result<bool, LocalSkillRepositoryError> {
         self.delete_core_skill(id).map_err(repository_error)
+    }
+
+    fn reconcile_local_skills(
+        &self,
+        upserts: &[LocalSkill],
+        removed_ids: &[String],
+    ) -> Result<Vec<LocalSkill>, LocalSkillRepositoryError> {
+        self.reconcile_core_skill_index(upserts, removed_ids)
+            .map_err(repository_error)
     }
 }
 
@@ -170,4 +268,60 @@ fn checked_sqlite_u64(value: u64, field: &str) -> Result<i64, AppError> {
 
 fn repository_error(error: AppError) -> LocalSkillRepositoryError {
     LocalSkillRepositoryError::new(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ManagedClientApps, ManagedClientId};
+
+    fn skill(id: &str, name: &str) -> LocalSkill {
+        LocalSkill {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            directory: id.to_string(),
+            content_hash: Some("a".repeat(64)),
+            total_size_bytes: 1,
+            file_count: 1,
+            apps: ManagedClientApps::only(ManagedClientId::Claude),
+            cloud_eligible: true,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn reconcile_rolls_back_upserts_when_a_later_delete_fails() {
+        let database = Database::memory().expect("create database");
+        let original_update = skill("update", "Before");
+        let original_remove = skill("remove", "Remove");
+        database
+            .save_core_skills(&[original_update.clone(), original_remove.clone()])
+            .expect("seed Skills");
+        {
+            let conn = database.conn.lock().unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER fail_skill_delete
+                 BEFORE DELETE ON core_skills
+                 WHEN OLD.id = 'remove'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected delete failure');
+                 END;",
+            )
+            .expect("install failure trigger");
+        }
+        let mut changed = original_update.clone();
+        changed.name = "After".to_string();
+        changed.updated_at_ms = 2;
+
+        database
+            .reconcile_core_skill_index(&[changed], &["remove".to_string()])
+            .expect_err("one failed statement must roll back the whole reconcile");
+
+        assert_eq!(
+            database.list_core_skills().expect("read unchanged index"),
+            vec![original_update, original_remove]
+        );
+    }
 }

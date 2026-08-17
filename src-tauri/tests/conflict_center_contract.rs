@@ -110,6 +110,8 @@ struct MemoryRollbacks {
     created_payloads: Mutex<Vec<Vec<u8>>>,
     deleted: Mutex<Vec<String>>,
     retained: Mutex<Vec<String>>,
+    fail_delete: bool,
+    fail_retain: bool,
 }
 
 impl TemporaryRollbackStore for MemoryRollbacks {
@@ -148,12 +150,18 @@ impl TemporaryRollbackStore for MemoryRollbacks {
     }
 
     fn delete_after_success(&self, id: &str) -> Result<(), TemporaryRollbackError> {
+        self.deleted.lock().unwrap().push(id.to_string());
+        if self.fail_delete {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::Io,
+                "injected rollback delete failure with sensitive details",
+            ));
+        }
         self.points
             .lock()
             .unwrap()
             .remove(id)
             .ok_or_else(not_found)?;
-        self.deleted.lock().unwrap().push(id.to_string());
         Ok(())
     }
 
@@ -162,14 +170,18 @@ impl TemporaryRollbackStore for MemoryRollbacks {
         id: &str,
         failed_at_ms: i64,
     ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
+        self.retained.lock().unwrap().push(id.to_string());
+        if self.fail_retain {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::Protection,
+                "injected rollback retention failure with sensitive details",
+            ));
+        }
         let mut points = self.points.lock().unwrap();
         let (metadata, _) = points.get_mut(id).ok_or_else(not_found)?;
         metadata.state = RollbackPointState::Failed;
         metadata.failed_at_ms = Some(failed_at_ms);
-        let result = metadata.clone();
-        drop(points);
-        self.retained.lock().unwrap().push(id.to_string());
-        Ok(result)
+        Ok(metadata.clone())
     }
 
     fn list(&self) -> Result<Vec<RollbackPointMetadata>, TemporaryRollbackError> {
@@ -270,6 +282,42 @@ fn one_conflict_does_not_block_a_confirmable_record() {
 }
 
 #[test]
+fn committed_resolution_survives_rollback_cleanup_failure_and_marks_the_point() {
+    let source = FixedSource(vec![item(
+        "committed_item",
+        ConflictCenterSource::LocalScan,
+        PortableDomain::Mcp,
+        Some(ManagedClientId::Claude),
+        "committed",
+        ConflictCenterDisposition::Difference(LocalDifferenceKind::Modified),
+    )]);
+    let resolver = RecordingResolver::default();
+    let rollbacks = MemoryRollbacks {
+        fail_delete: true,
+        ..Default::default()
+    };
+
+    resolve_conflict_center_item(
+        &[&source],
+        &resolver,
+        &rollbacks,
+        250,
+        &ConflictResolutionRequest {
+            item_id: "committed_item".to_string(),
+            action: ConflictResolutionAction::AcceptExternal,
+        },
+    )
+    .expect("committed resolution must survive rollback cleanup failure");
+
+    assert_eq!(resolver.applied.lock().unwrap().len(), 1);
+    assert_eq!(rollbacks.deleted.lock().unwrap().as_slice(), &["point-1"]);
+    assert_eq!(rollbacks.retained.lock().unwrap().as_slice(), &["point-1"]);
+    let points = rollbacks.points.lock().unwrap();
+    assert_eq!(points["point-1"].0.state, RollbackPointState::Failed);
+    assert_eq!(points["point-1"].0.failed_at_ms, Some(250));
+}
+
+#[test]
 fn failed_resolution_retains_rollback_and_does_not_consume_other_items() {
     let source = FixedSource(vec![
         item(
@@ -310,6 +358,41 @@ fn failed_resolution_retains_rollback_and_does_not_consume_other_items() {
     assert!(rollbacks.deleted.lock().unwrap().is_empty());
     let listed = list_conflict_center_items(&[&source], &resolver).unwrap();
     assert_eq!(listed.len(), 2);
+}
+
+#[test]
+fn rollback_mark_failure_does_not_replace_resolution_apply_error() {
+    let source = FixedSource(vec![item(
+        "failed_item",
+        ConflictCenterSource::LocalScan,
+        PortableDomain::Skill,
+        Some(ManagedClientId::Opencode),
+        "failed",
+        ConflictCenterDisposition::Difference(LocalDifferenceKind::Modified),
+    )]);
+    let resolver = RecordingResolver::default();
+    *resolver.fail_item.lock().unwrap() = Some("failed_item".to_string());
+    let rollbacks = MemoryRollbacks {
+        fail_retain: true,
+        ..Default::default()
+    };
+
+    let error = resolve_conflict_center_item(
+        &[&source],
+        &resolver,
+        &rollbacks,
+        350,
+        &ConflictResolutionRequest {
+            item_id: "failed_item".to_string(),
+            action: ConflictResolutionAction::KeepLocal,
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, ConflictCenterErrorCode::Apply);
+    assert_eq!(error.message, "fixture apply failed");
+    assert_eq!(rollbacks.retained.lock().unwrap().as_slice(), &["point-1"]);
+    assert!(rollbacks.deleted.lock().unwrap().is_empty());
 }
 
 #[test]

@@ -148,7 +148,7 @@ fn invalid_full_content_fails_with_only_stable_classification() {
 }
 
 #[test]
-fn production_full_parser_has_no_write_database_or_network_dependency() {
+fn production_full_parser_has_no_write_or_network_dependency() {
     let source = include_str!("../src/adapters/local_scan_parser.rs").to_ascii_lowercase();
     for forbidden in [
         "atomic_write",
@@ -157,7 +157,6 @@ fn production_full_parser_has_no_write_database_or_network_dependency() {
         "reqwest",
         "rusqlite",
         "appstate",
-        "database",
     ] {
         assert!(
             !source.contains(forbidden),

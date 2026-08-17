@@ -1,16 +1,70 @@
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
+
 use sha2::{Digest, Sha256};
 
 use crate::adapters::local_skill_tree::LocalSkillTreeAdapter;
+use crate::database::Database;
 use crate::domain::{
     prompt_live_filename, LocalScanDomain, LocalScanEntrySummary, LocalScanFailureKind,
-    LocalScanSummary, LocalScanTarget, ManagedClientId,
+    LocalScanSummary, LocalScanTarget, LocalSkill, ManagedClientId,
 };
 use crate::ports::{
-    LocalScanReadFailure, LocalScanSummaryPort, LocalSkillTreeError, LocalSkillTreeErrorCode,
-    WslFileError, WslFileErrorCode, WslFileSystem, WslPathScope,
+    LocalScanFirstObservation, LocalScanReadFailure, LocalScanSummaryPort, LocalSkillTreeError,
+    LocalSkillTreeErrorCode, ManagedSkillInventoryPort, WslFileError, WslFileErrorCode,
+    WslFileSystem, WslPathScope,
 };
 
 use super::wsl_files::WslFileAdapter;
+
+/// Database-backed, read-only managed Skill inventory. A per-client snapshot is
+/// shared by the summary and parser adapters so one observation cannot mix two
+/// different database reads. Summary scans explicitly refresh it first.
+pub struct DatabaseManagedSkillInventory {
+    database: Arc<Database>,
+    cached: Mutex<HashMap<ManagedClientId, Vec<LocalSkill>>>,
+}
+
+impl DatabaseManagedSkillInventory {
+    pub fn new(database: Arc<Database>) -> Self {
+        Self {
+            database,
+            cached: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn read_database(&self) -> Result<Vec<LocalSkill>, LocalScanReadFailure> {
+        self.database
+            .list_core_skills()
+            .map_err(|_| read_failure(None))
+    }
+}
+
+impl ManagedSkillInventoryPort for DatabaseManagedSkillInventory {
+    fn list_managed_skills(
+        &self,
+        client: ManagedClientId,
+    ) -> Result<Vec<LocalSkill>, LocalScanReadFailure> {
+        self.cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&client)
+            .cloned()
+            .ok_or_else(|| read_failure(None))
+    }
+
+    fn refresh_managed_skills(
+        &self,
+        client: ManagedClientId,
+    ) -> Result<Vec<LocalSkill>, LocalScanReadFailure> {
+        let skills = self.read_database()?;
+        self.cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(client, skills.clone());
+        Ok(skills)
+    }
+}
 
 /// Reads content-free summaries from the one supported WSL environment.
 #[derive(Debug, Clone, Default)]
@@ -87,6 +141,132 @@ impl LocalScanSummaryPort for FixedLocalScanSummaryAdapter {
                 self.scan_files(target)
             }
         }
+    }
+}
+
+/// Production composite: non-Skill domains retain their fixed adapters while
+/// Skill scans are constrained to the database-known directory inventory.
+pub struct DatabaseLocalScanSummaryAdapter {
+    fixed: FixedLocalScanSummaryAdapter,
+    inventory: Arc<dyn ManagedSkillInventoryPort>,
+    skills: LocalSkillTreeAdapter,
+}
+
+impl DatabaseLocalScanSummaryAdapter {
+    pub fn new(inventory: Arc<dyn ManagedSkillInventoryPort>) -> Self {
+        Self {
+            fixed: FixedLocalScanSummaryAdapter::runtime(),
+            inventory,
+            skills: LocalSkillTreeAdapter::runtime(),
+        }
+    }
+
+    pub fn runtime(database: Arc<Database>) -> (Self, Arc<dyn ManagedSkillInventoryPort>) {
+        let inventory: Arc<dyn ManagedSkillInventoryPort> =
+            Arc::new(DatabaseManagedSkillInventory::new(database));
+        (Self::new(inventory.clone()), inventory)
+    }
+
+    fn scan_managed_skills(
+        &self,
+        target: LocalScanTarget,
+        records: &[LocalSkill],
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        let directories: BTreeSet<_> = records
+            .iter()
+            .map(|skill| skill.directory.clone())
+            .collect();
+        if directories.len() != records.len() {
+            return Err(read_failure(None));
+        }
+        let candidates = self
+            .skills
+            .scan_managed(target.client_id, directories)
+            .map_err(map_skill_error)?;
+        let entries = candidates
+            .into_iter()
+            .map(|candidate| {
+                LocalScanEntrySummary::new(
+                    candidate.directory.as_str(),
+                    candidate.tree.content_hash.as_str(),
+                    candidate.tree.total_size_bytes,
+                    None,
+                )
+                .map_err(|_| digest_failure(Some(candidate.directory.as_str())))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        build_summary(target, entries)
+    }
+
+    fn expected_skill_summary(
+        &self,
+        target: LocalScanTarget,
+        records: &[LocalSkill],
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        let entries = records
+            .iter()
+            .filter(|skill| skill.apps.is_enabled_for(target.client_id))
+            .filter_map(|skill| {
+                skill.content_hash.as_deref().map(|content_hash| {
+                    LocalScanEntrySummary::new(
+                        skill.directory.as_str(),
+                        content_hash,
+                        skill.total_size_bytes,
+                        None,
+                    )
+                    .map_err(|_| digest_failure(Some(skill.directory.as_str())))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        build_summary(target, entries)
+    }
+}
+
+impl LocalScanSummaryPort for DatabaseLocalScanSummaryAdapter {
+    fn scan_summary(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        if target.domain != LocalScanDomain::Skill {
+            return self.fixed.scan_summary(target);
+        }
+        let records = self.inventory.refresh_managed_skills(target.client_id)?;
+        self.scan_managed_skills(target, &records)
+    }
+
+    fn expected_after_write(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanSummary, LocalScanReadFailure> {
+        if target.domain != LocalScanDomain::Skill {
+            return self.fixed.scan_summary(target);
+        }
+        let records = self.inventory.refresh_managed_skills(target.client_id)?;
+        self.expected_skill_summary(target, &records)
+    }
+
+    fn scan_first_observation(
+        &self,
+        target: LocalScanTarget,
+    ) -> Result<LocalScanFirstObservation, LocalScanReadFailure> {
+        if target.domain != LocalScanDomain::Skill {
+            return Ok(LocalScanFirstObservation {
+                current: self.fixed.scan_summary(target)?,
+                baseline: None,
+                requires_parse: false,
+            });
+        }
+        let records = self.inventory.refresh_managed_skills(target.client_id)?;
+        let current = self.scan_managed_skills(target, &records)?;
+        let baseline = self.expected_skill_summary(target, &records)?;
+        let requires_parse = records.iter().any(|skill| {
+            skill.apps.is_enabled_for(target.client_id) && skill.content_hash.is_none()
+        });
+        Ok(LocalScanFirstObservation {
+            current,
+            baseline: Some(baseline),
+            requires_parse,
+        })
     }
 }
 
@@ -174,6 +354,13 @@ fn sha256(contents: &[u8]) -> String {
 fn digest_failure(record_id: Option<&str>) -> LocalScanReadFailure {
     LocalScanReadFailure {
         kind: LocalScanFailureKind::DigestFailed,
+        record_id: record_id.map(ToOwned::to_owned),
+    }
+}
+
+fn read_failure(record_id: Option<&str>) -> LocalScanReadFailure {
+    LocalScanReadFailure {
+        kind: LocalScanFailureKind::ReadFailed,
         record_id: record_id.map(ToOwned::to_owned),
     }
 }

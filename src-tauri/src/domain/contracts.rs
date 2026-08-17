@@ -207,6 +207,7 @@ pub enum RollbackPointPurpose {
     DataMigration,
     WebdavSync,
     ConflictResolution,
+    SkillIndexRefresh,
     RestoreOperation,
     RemoteReset,
 }

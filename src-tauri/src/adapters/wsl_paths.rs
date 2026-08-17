@@ -32,6 +32,10 @@ impl FixedWslPathResolver {
         Self::production()
     }
 
+    pub(crate) fn windows_home(&self) -> &Path {
+        &self.windows_home
+    }
+
     fn pair(&self, windows_relative: &Path, wsl_relative: &str) -> WslPathPair {
         WslPathPair {
             windows: self.windows_home.join(windows_relative),

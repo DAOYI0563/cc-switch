@@ -442,13 +442,13 @@ impl LocalScanExecutor for WedgedExecutor {
 }
 
 #[tokio::test]
-async fn wedged_scan_cycles_are_cut_off_by_the_deadline() {
+async fn timed_out_blocking_scan_never_accumulates_another_reader() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let cadence = LocalScanCadence {
         foreground: Duration::from_millis(25),
         background: Duration::from_millis(100),
     };
-    // Deadline = background * 4 = 400ms; each scan hangs for 2s.
+    // Deadline = background * 4 = 400ms; each blocking scan runs for 2s.
     let (scheduler, worker) = LocalScanScheduler::new(
         Arc::new(WedgedExecutor {
             calls: tx,
@@ -460,9 +460,13 @@ async fn wedged_scan_cycles_are_cut_off_by_the_deadline() {
     let task = tokio::spawn(worker.run());
 
     let _ = next_call(&mut rx, Duration::from_millis(200)).await;
-    // Without the cycle deadline the worker would stay parked on the first
-    // wedged read forever; with it, a fresh cycle starts within ~1.5s.
-    let _ = next_call(&mut rx, Duration::from_millis(1500)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1200), rx.recv())
+            .await
+            .is_err(),
+        "a timed-out blocking scan must remain the only in-flight reader"
+    );
+    let _ = next_call(&mut rx, Duration::from_millis(1200)).await;
 
     scheduler.cancel().unwrap();
     tokio::time::timeout(Duration::from_millis(500), task)

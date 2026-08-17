@@ -86,6 +86,36 @@ fn filesystem_heavy_skill_commands_run_off_the_async_runtime() {
 }
 
 #[test]
+fn authoritative_skill_refresh_waits_for_the_committing_blocking_task() {
+    let command = read("src/commands/skill.rs");
+    let start = command
+        .find("pub async fn scan_unmanaged_skills")
+        .expect("scan command");
+    let end = command[start..]
+        .find("pub async fn import_skills_from_apps")
+        .map(|offset| start + offset)
+        .expect("next command");
+    let scan_command = &command[start..end];
+
+    assert!(scan_command.contains("spawn_blocking"));
+    assert!(!scan_command.contains("tokio::time::timeout"));
+    assert!(scan_command.contains("restart_target_observation"));
+}
+
+#[test]
+fn unmanaged_skill_ipc_contract_contains_no_absolute_path_field() {
+    let domain = read("src/domain/skill.rs");
+    let start = domain
+        .find("pub struct UnmanagedLocalSkill")
+        .expect("unmanaged Skill contract");
+    let end = domain[start..]
+        .find("pub enum LocalSkillScanIssueKind")
+        .map(|offset| start + offset)
+        .expect("next Skill contract");
+    assert!(!domain[start..end].contains("pub path:"));
+}
+
+#[test]
 fn legacy_skill_service_repository_and_deep_link_are_absent() {
     for relative in [
         "src/services/skill.rs",

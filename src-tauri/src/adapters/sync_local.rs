@@ -9,10 +9,10 @@ use serde_json::{json, Map, Value};
 use crate::app_config::LegacyAppType;
 use crate::database::DailyBriefRecord;
 use crate::domain::{
-    content_hash, validate_html, validate_skill_cloud_total, DailyBriefStatus, LocalSkill,
-    ManagedClientApps, ManagedClientId, McpServer, PortableDomain, PortablePayload,
-    PortableRecordId, PromptVersion, SyncDeviceId, SyncLocalCommitPlan, SyncLocalSnapshot,
-    SyncMergeSideAction, SyncRecord, SyncRecordBaseline,
+    content_hash, validate_html, validate_skill_cloud_total, DailyBriefStatus, LocalScanDomain,
+    LocalScanTarget, LocalSkill, ManagedClientApps, ManagedClientId, McpServer, PortableDomain,
+    PortablePayload, PortableRecordId, PromptVersion, SyncDeviceId, SyncLocalCommitPlan,
+    SyncLocalSnapshot, SyncMergeSideAction, SyncRecord, SyncRecordBaseline,
 };
 use crate::ports::{
     ConflictCenterError, ConflictCenterErrorCode, LocalSkillFile, LocalSkillTree,
@@ -20,8 +20,8 @@ use crate::ports::{
 };
 use crate::provider::Provider;
 use crate::services::{
-    daily_brief, CommonSnippetService, LocalSkillService, McpService, PromptService,
-    ProviderService,
+    daily_brief, record_database_local_writes, CommonSnippetService, LocalSkillService, McpService,
+    PromptService, ProviderService,
 };
 use crate::store::AppState;
 
@@ -311,9 +311,13 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
         Ok(())
     }
 
-    fn apply_records(&self, plan: &SyncLocalCommitPlan) -> Result<(), ConflictCenterError> {
+    fn apply_records(
+        &self,
+        plan: &SyncLocalCommitPlan,
+    ) -> Result<HashSet<ManagedClientId>, ConflictCenterError> {
         let mut provider_clients = HashSet::new();
         let mut prompt_clients = HashSet::new();
+        let mut skill_clients = HashSet::new();
         let mut mcp_changed = false;
         for resolution in &plan.merge_batch.resolved {
             if resolution.local_action != SyncMergeSideAction::ApplyMerged {
@@ -329,7 +333,9 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
                 PortableDomain::Prompt => {
                     prompt_clients.insert(self.apply_prompt(&resolution.record)?);
                 }
-                PortableDomain::Skill => self.apply_skill(&resolution.record)?,
+                PortableDomain::Skill => {
+                    skill_clients.extend(self.apply_skill(&resolution.record)?);
+                }
                 PortableDomain::CommonSnippet => {
                     self.apply_common_snippet(&resolution.record)?;
                 }
@@ -356,7 +362,7 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
             PromptService::sync_to_live(self.state, client)
                 .map_err(|_| apply_error("failed to project synchronized Prompt"))?;
         }
-        Ok(())
+        Ok(skill_clients)
     }
 
     fn apply_provider(&self, record: &SyncRecord) -> Result<ManagedClientId, ConflictCenterError> {
@@ -510,13 +516,20 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
         Ok(client)
     }
 
-    fn apply_skill(&self, record: &SyncRecord) -> Result<(), ConflictCenterError> {
+    fn apply_skill(
+        &self,
+        record: &SyncRecord,
+    ) -> Result<HashSet<ManagedClientId>, ConflictCenterError> {
         let trees = LocalSkillTreeAdapter::runtime();
         let existing = self
             .state
             .db
             .get_core_skill(&record.id.key)
             .map_err(|_| apply_error("failed to read synchronized Skill"))?;
+        let mut affected: HashSet<_> = existing
+            .iter()
+            .flat_map(|skill| skill.apps.enabled_clients())
+            .collect();
         let Some(_) = &record.payload else {
             if let Some(existing) = existing {
                 for client in existing.apps.enabled_clients() {
@@ -529,11 +542,12 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
                     .delete_core_skill(&record.id.key)
                     .map_err(|_| apply_error("failed to delete synchronized Skill"))?;
             }
-            return Ok(());
+            return Ok(affected);
         };
         let content = payload_content(record, PortableDomain::Skill)?;
         require_equal_string(&content, "id", &record.id.key)?;
         let skill = local_skill_from_payload(&content)?;
+        affected.extend(skill.apps.enabled_clients());
         let files: SkillFilesPayload = content
             .get("files")
             .cloned()
@@ -559,7 +573,8 @@ impl<'a> RuntimeSyncLocalAdapter<'a> {
         self.state
             .db
             .save_core_skills(&[skill])
-            .map_err(|_| apply_error("failed to save synchronized Skill"))
+            .map_err(|_| apply_error("failed to save synchronized Skill"))?;
+        Ok(affected)
     }
 
     fn apply_common_snippet(&self, record: &SyncRecord) -> Result<(), ConflictCenterError> {
@@ -713,12 +728,23 @@ impl SyncLocalApplyPort for RuntimeSyncLocalAdapter<'_> {
     fn apply_and_validate(&self, plan: &SyncLocalCommitPlan) -> Result<(), ConflictCenterError> {
         plan.validate()
             .map_err(|_| invalid_input("sync local commit plan is invalid"))?;
-        self.apply_records(plan)?;
+        let skill_clients = self.apply_records(plan)?;
         self.state
             .db
             .commit_sync_metadata(plan)
             .map_err(|_| apply_error("failed to commit local sync metadata"))?;
-        self.validate_committed_metadata(plan)
+        self.validate_committed_metadata(plan)?;
+        if !skill_clients.is_empty() {
+            record_database_local_writes(
+                &self.state.local_scan_writes,
+                self.state.db.clone(),
+                skill_clients.into_iter().map(|client_id| LocalScanTarget {
+                    domain: LocalScanDomain::Skill,
+                    client_id,
+                }),
+            );
+        }
+        Ok(())
     }
 }
 

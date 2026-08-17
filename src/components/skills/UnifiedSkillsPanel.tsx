@@ -10,6 +10,7 @@ import {
   Search,
   Sparkles,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -29,11 +30,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { APP_ICON_MAP, SKILLS_APP_IDS } from "@/config/appConfig";
 import {
   type ImportSkillSelection,
   type InstalledSkill,
+  type LocalSkillScanIssue,
+  type LocalSkillScanResult,
   type UnmanagedSkill,
   useBulkToggleSkillApp,
   useImportSkillsFromApps,
@@ -62,41 +70,14 @@ const emptyApps = (): ImportSkillSelection["apps"] => ({
   opencode: false,
 });
 
-const sourceOnlyApps = (
-  source: ManagedAppId,
-): ImportSkillSelection["apps"] => ({
-  ...emptyApps(),
-  [source]: true,
-});
-
-const contentHashFor = (
-  skill: UnmanagedSkill,
-  app: ManagedAppId,
-): string | undefined =>
-  skill.copies?.find((copy) => copy.client === app)?.contentHash;
-
-/** Targets default to the source plus every found copy with an identical hash. */
-const defaultAppsFor = (
-  skill: UnmanagedSkill,
-  source: ManagedAppId,
+const foundAppsFor = (
+  skill: Pick<UnmanagedSkill, "foundIn">,
 ): ImportSkillSelection["apps"] => {
-  const sourceHash = contentHashFor(skill, source);
-  if (!skill.copies || !sourceHash) return sourceOnlyApps(source);
   const apps = emptyApps();
-  apps[source] = true;
-  for (const copy of skill.copies) {
-    if (copy.client !== source && copy.contentHash === sourceHash) {
-      apps[copy.client] = true;
-    }
+  for (const app of skill.foundIn) {
+    apps[app] = true;
   }
   return apps;
-};
-
-/** null = single copy or digests unavailable; true/false = consistency across copies. */
-const copiesConsistent = (skill: UnmanagedSkill): boolean | null => {
-  if (!skill.copies || skill.copies.length < 2) return null;
-  const [first] = skill.copies;
-  return skill.copies.every((copy) => copy.contentHash === first.contentHash);
 };
 
 const formatSkillSize = (bytes: number): string => {
@@ -129,6 +110,9 @@ const UnifiedSkillsPanel = React.forwardRef<
     const [searchQuery, setSearchQuery] = useState("");
     const [importDialogOpen, setImportDialogOpen] = useState(false);
     const [scanPending, setScanPending] = useState(false);
+    const [scanResult, setScanResult] = useState<LocalSkillScanResult | null>(
+      null,
+    );
     const [writePending, setWritePending] = useState(false);
     const writeLockRef = React.useRef(false);
     const [skillToDelete, setSkillToDelete] = useState<InstalledSkill | null>(
@@ -148,9 +132,12 @@ const UnifiedSkillsPanel = React.forwardRef<
     const syncFromLiveMutation = useSyncSkillFromLive();
     const uninstallMutation = useUninstallSkill();
     const importMutation = useImportSkillsFromApps();
-    const { data: unmanagedSkills, refetch: scanUnmanaged } =
-      useScanUnmanagedSkills({ enabled: false });
+    const { data: cachedScanResult, refetch: scanUnmanaged } =
+      useScanUnmanagedSkills({
+        enabled: false,
+      });
 
+    const latestScanResult = scanResult ?? cachedScanResult ?? null;
     const mutationPending =
       toggleAppMutation.isPending ||
       bulkToggleAppMutation.isPending ||
@@ -219,6 +206,24 @@ const UnifiedSkillsPanel = React.forwardRef<
         ),
       );
     }, [searchQuery, skills]);
+
+    const issuesByDirectory = useMemo(() => {
+      const grouped = new Map<string, LocalSkillScanIssue[]>();
+      for (const issue of latestScanResult?.issues ?? []) {
+        const issues = grouped.get(issue.directory) ?? [];
+        issues.push(issue);
+        grouped.set(issue.directory, issues);
+      }
+      return grouped;
+    }, [latestScanResult]);
+    const standaloneIssues = useMemo(() => {
+      const managedDirectories = new Set(
+        (skills ?? []).map((skill) => skill.directory),
+      );
+      return (latestScanResult?.issues ?? []).filter(
+        (issue) => !managedDirectories.has(issue.directory),
+      );
+    }, [latestScanResult, skills]);
 
     const sourceFor = (skill: InstalledSkill): ManagedAppId =>
       SKILLS_APP_IDS.find((app) => skill.apps[app]) ?? currentApp;
@@ -324,14 +329,36 @@ const UnifiedSkillsPanel = React.forwardRef<
       try {
         const result = await scanUnmanaged();
         if (result.error) throw result.error;
-        if (!result.data || result.data.length === 0) {
-          setImportDialogOpen(false);
-          toast.success(t("skills.noUnmanagedFound"), { closeButton: true });
-          return;
+        if (!result.data) throw new Error(t("skills.scanInvalidResult"));
+
+        const nextScan = result.data;
+        setScanResult(nextScan);
+        const hasReconciledChanges =
+          nextScan.updatedCount > 0 || nextScan.removedCount > 0;
+        const hasIssues = nextScan.issues.length > 0;
+        if (hasReconciledChanges || hasIssues) {
+          const notify = hasIssues ? toast.warning : toast.success;
+          notify(
+            t("skills.scanResult", {
+              updatedCount: nextScan.updatedCount,
+              removedCount: nextScan.removedCount,
+              issueCount: nextScan.issues.length,
+            }),
+            { closeButton: true },
+          );
         }
-      } catch (error) {
+
+        if (nextScan.unmanaged.length === 0) {
+          setImportDialogOpen(false);
+          if (!hasReconciledChanges && !hasIssues) {
+            toast.success(t("skills.noUnmanagedFound"), { closeButton: true });
+          }
+        }
+      } catch {
         setImportDialogOpen(false);
-        toast.error(t("skills.scanFailed"), { description: String(error) });
+        toast.error(t("skills.scanFailed"), {
+          description: t("skills.scanFailedDescription"),
+        });
       } finally {
         setScanPending(false);
         endWrite();
@@ -384,6 +411,9 @@ const UnifiedSkillsPanel = React.forwardRef<
 
           <ScrollArea className="-mr-3 min-h-0 flex-1" type="auto">
             <div className="pb-24 pr-3">
+              {standaloneIssues.length > 0 && (
+                <StandaloneSkillIssues issues={standaloneIssues} />
+              )}
               {isLoading ? (
                 <div className="py-12 text-center text-muted-foreground">
                   {t("skills.loading")}
@@ -441,6 +471,7 @@ const UnifiedSkillsPanel = React.forwardRef<
                     <InstalledSkillListItem
                       key={skill.id}
                       skill={skill}
+                      issues={issuesByDirectory.get(skill.directory) ?? []}
                       currentApp={currentApp}
                       actionsDisabled={interactionBlocked}
                       isSyncing={
@@ -484,7 +515,7 @@ const UnifiedSkillsPanel = React.forwardRef<
 
           <ImportSkillsDialog
             open={importDialogOpen}
-            skills={unmanagedSkills ?? []}
+            skills={latestScanResult?.unmanaged ?? []}
             isScanning={scanPending}
             isImporting={importMutation.isPending}
             onImport={handleImport}
@@ -498,8 +529,67 @@ const UnifiedSkillsPanel = React.forwardRef<
 
 UnifiedSkillsPanel.displayName = "UnifiedSkillsPanel";
 
+const issueTranslationKey = (
+  kind: LocalSkillScanIssue["kind"],
+): "divergentCopies" | "invalidCopy" | "caseCollision" => {
+  switch (kind) {
+    case "divergent_copies":
+      return "divergentCopies";
+    case "invalid_copy":
+      return "invalidCopy";
+    case "case_collision":
+      return "caseCollision";
+  }
+};
+
+function StandaloneSkillIssues({ issues }: { issues: LocalSkillScanIssue[] }) {
+  const { t } = useTranslation();
+
+  return (
+    <section
+      className="mb-3 rounded-lg border border-destructive/40 bg-destructive/5 p-3"
+      aria-label={t("skills.scanIssuesTitle")}
+    >
+      <div className="flex items-center gap-2 text-sm font-medium text-destructive">
+        <TriangleAlert size={16} />
+        {t("skills.scanIssuesTitle")}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {t("skills.scanIssuesDescription")}
+      </p>
+      <div className="mt-2 space-y-2">
+        {issues.map((issue) => {
+          const issueKey = issueTranslationKey(issue.kind);
+          const clients = issue.clients
+            .map((app) => t(`skills.apps.${app}`))
+            .join("、");
+          return (
+            <div
+              key={`${issue.directory}:${issue.kind}:${issue.clients.join(",")}`}
+              className="flex items-center gap-2 rounded border border-border-default bg-background/70 px-2 py-1.5"
+            >
+              <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                {issue.directory}
+              </span>
+              <Badge
+                variant="outline"
+                className="h-5 shrink-0 gap-1 border-destructive/50 bg-destructive/10 px-1.5 text-[10px] text-destructive"
+                title={t(`skills.issues.${issueKey}.tooltip`, { clients })}
+              >
+                <TriangleAlert size={11} />
+                {t(`skills.issues.${issueKey}.badge`)}
+              </Badge>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 interface InstalledSkillListItemProps {
   skill: InstalledSkill;
+  issues: LocalSkillScanIssue[];
   currentApp: ManagedAppId;
   actionsDisabled: boolean;
   isSyncing: boolean;
@@ -512,6 +602,7 @@ interface InstalledSkillListItemProps {
 
 function InstalledSkillListItem({
   skill,
+  issues,
   currentApp,
   actionsDisabled,
   isSyncing,
@@ -545,6 +636,34 @@ function InstalledSkillListItem({
               {t("skills.localOnly")}
             </Badge>
           )}
+          {issues.map((issue) => {
+            const issueKey = issueTranslationKey(issue.kind);
+            const clients = issue.clients
+              .map((app) => t(`skills.apps.${app}`))
+              .join("、");
+            return (
+              <Tooltip key={`${issue.kind}:${issue.clients.join(",")}`}>
+                <TooltipTrigger asChild>
+                  <div
+                    tabIndex={0}
+                    className="shrink-0"
+                    aria-label={t(`skills.issues.${issueKey}.label`)}
+                  >
+                    <Badge
+                      variant="outline"
+                      className="h-5 gap-1 border-destructive/50 bg-destructive/10 px-1.5 text-[10px] text-destructive"
+                    >
+                      <TriangleAlert size={11} />
+                      {t(`skills.issues.${issueKey}.badge`)}
+                    </Badge>
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">
+                  {t(`skills.issues.${issueKey}.tooltip`, { clients })}
+                </TooltipContent>
+              </Tooltip>
+            );
+          })}
         </div>
         <p
           className="truncate text-xs text-muted-foreground"
@@ -595,8 +714,12 @@ function InstalledSkillListItem({
           size="icon"
           className="h-7 w-7 hover:bg-red-100 hover:text-red-500 disabled:opacity-100 dark:hover:bg-red-500/10 dark:hover:text-red-400"
           onClick={onDelete}
-          disabled={actionsDisabled}
-          title={t("skills.uninstall")}
+          disabled={actionsDisabled || issues.length > 0}
+          title={
+            issues.length > 0
+              ? t("skills.issueRemovalBlocked")
+              : t("skills.uninstall")
+          }
           aria-label={t("skills.uninstall")}
         >
           <Trash2 size={14} />
@@ -840,10 +963,7 @@ function ImportSkillsDialog({
     setSelected(new Set(skills.map((skill) => skill.directory)));
     setSelectedApps(
       Object.fromEntries(
-        skills.map((skill) => {
-          const source = skill.foundIn[0] ?? "claude";
-          return [skill.directory, defaultAppsFor(skill, source)];
-        }),
+        skills.map((skill) => [skill.directory, foundAppsFor(skill)]),
       ),
     );
     setSelectedSources(
@@ -908,24 +1028,6 @@ function ImportSkillsDialog({
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="truncate font-medium">{skill.name}</span>
-                      {copiesConsistent(skill) === true && (
-                        <Badge
-                          variant="outline"
-                          className="h-5 shrink-0 gap-1 px-1.5 text-[10px] border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                          title={t("skills.importCopiesConsistentTitle")}
-                        >
-                          {t("skills.importCopiesConsistent")}
-                        </Badge>
-                      )}
-                      {copiesConsistent(skill) === false && (
-                        <Badge
-                          variant="outline"
-                          className="h-5 shrink-0 gap-1 px-1.5 text-[10px] border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
-                          title={t("skills.importCopiesConflictTitle")}
-                        >
-                          {t("skills.importCopiesConflict")}
-                        </Badge>
-                      )}
                     </div>
                     {skill.description && (
                       <p className="line-clamp-1 text-sm text-muted-foreground">
@@ -945,13 +1047,6 @@ function ImportSkillsDialog({
                             setSelectedSources((previous) => ({
                               ...previous,
                               [skill.directory]: nextSource,
-                            }));
-                            setSelectedApps((previous) => ({
-                              ...previous,
-                              [skill.directory]: defaultAppsFor(
-                                skill,
-                                nextSource,
-                              ),
                             }));
                           }}
                         >
@@ -980,9 +1075,9 @@ function ImportSkillsDialog({
                     </div>
                     <p
                       className="mt-1 truncate text-xs text-muted-foreground/60"
-                      title={skill.path}
+                      title={skill.directory}
                     >
-                      {skill.path}
+                      {t("skills.detailDirectory")}：{skill.directory}
                     </p>
                   </div>
                 </div>

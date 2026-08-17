@@ -246,18 +246,14 @@ pub fn resolve_conflict_center_item(
         .map_err(|error| rollback_error("create", error))?;
 
     match resolver.apply_and_validate(item, request) {
-        Ok(()) => rollback_store
-            .delete_after_success(&rollback.id)
-            .map_err(|error| rollback_error("delete", error)),
-        Err(primary) => match rollback_store.retain_after_failure(&rollback.id, now_ms) {
-            Ok(_) => Err(primary),
-            Err(retain_error) => Err(ConflictCenterError::new(
-                ConflictCenterErrorCode::Rollback,
-                "conflict resolution failed and rollback point retention also failed",
-            )
-            .with_context("applyCode", format!("{:?}", primary.code))
-            .with_context("retainCode", format!("{:?}", retain_error.code))),
-        },
+        Ok(()) => {
+            cleanup_rollback_after_success(rollback_store, &rollback.id, now_ms);
+            Ok(())
+        }
+        Err(primary) => {
+            retain_rollback_after_failure(rollback_store, &rollback.id, now_ms);
+            Err(primary)
+        }
     }
 }
 
@@ -284,18 +280,14 @@ pub fn apply_committed_sync_batch(
         .map_err(|error| rollback_error("create", error))?;
 
     match applier.apply_and_validate(plan) {
-        Ok(()) => rollback_store
-            .delete_after_success(&rollback.id)
-            .map_err(|error| rollback_error("delete", error)),
-        Err(primary) => match rollback_store.retain_after_failure(&rollback.id, now_ms) {
-            Ok(_) => Err(primary),
-            Err(retain_error) => Err(ConflictCenterError::new(
-                ConflictCenterErrorCode::Rollback,
-                "sync local apply failed and rollback point retention also failed",
-            )
-            .with_context("applyCode", format!("{:?}", primary.code))
-            .with_context("retainCode", format!("{:?}", retain_error.code))),
-        },
+        Ok(()) => {
+            cleanup_rollback_after_success(rollback_store, &rollback.id, now_ms);
+            Ok(())
+        }
+        Err(primary) => {
+            retain_rollback_after_failure(rollback_store, &rollback.id, now_ms);
+            Err(primary)
+        }
     }
 }
 
@@ -543,6 +535,38 @@ fn rollback_error(
         format!("failed to {operation} conflict-resolution rollback point"),
     )
     .with_context("rollbackCode", format!("{:?}", error.code))
+}
+
+fn cleanup_rollback_after_success(
+    rollback_store: &dyn TemporaryRollbackStore,
+    rollback_id: &str,
+    now_ms: i64,
+) {
+    if let Err(error) = rollback_store.delete_after_success(rollback_id) {
+        log::warn!(
+            "rollback_cleanup_delete_after_success_failed code={:?}",
+            error.code
+        );
+        if let Err(error) = rollback_store.retain_after_failure(rollback_id, now_ms) {
+            log::warn!(
+                "rollback_cleanup_retain_after_delete_failure_failed code={:?}",
+                error.code
+            );
+        }
+    }
+}
+
+fn retain_rollback_after_failure(
+    rollback_store: &dyn TemporaryRollbackStore,
+    rollback_id: &str,
+    now_ms: i64,
+) {
+    if let Err(error) = rollback_store.retain_after_failure(rollback_id, now_ms) {
+        log::warn!(
+            "rollback_retain_after_apply_failure_failed code={:?}",
+            error.code
+        );
+    }
 }
 
 pub fn default_local_actions(item: &ConflictCenterItem) -> Vec<ConflictResolutionAction> {

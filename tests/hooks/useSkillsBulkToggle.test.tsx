@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useBulkToggleSkillApp,
+  useScanUnmanagedSkills,
   useSyncSkillFromLive,
   useToggleSkillApp,
   useUninstallSkill,
@@ -13,6 +14,7 @@ import type { InstalledSkill } from "@/lib/api/skills";
 
 const mocks = vi.hoisted(() => ({
   toggleApp: vi.fn(),
+  scanUnmanaged: vi.fn(),
   syncFromLive: vi.fn(),
   uninstallUnified: vi.fn(),
 }));
@@ -145,6 +147,92 @@ describe("local Skill mutation hooks", () => {
       "opencode",
       "codex",
       true,
+    );
+  });
+
+  it("replaces the installed cache with the complete successful scan result", async () => {
+    const stale = makeSkill("stale");
+    const refreshed = {
+      ...makeSkill("alpha"),
+      description: "refreshed metadata",
+      fileCount: 5,
+      apps: { claude: false, codex: true, opencode: false },
+    };
+    mocks.scanUnmanaged.mockResolvedValueOnce({
+      installed: [refreshed],
+      unmanaged: [],
+      issues: [],
+      updatedCount: 1,
+      removedCount: 1,
+    });
+    const client = createClient();
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    client.setQueryData(["skills", "installed"], [stale]);
+    const { result } = renderHook(
+      () => useScanUnmanagedSkills({ enabled: false }),
+      { wrapper: wrapper(client) },
+    );
+
+    await act(async () => {
+      await result.current.refetch();
+    });
+
+    expect(mocks.scanUnmanaged).toHaveBeenCalledTimes(1);
+    expect(
+      client.getQueryData<InstalledSkill[]>(["skills", "installed"]),
+    ).toEqual([refreshed]);
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ["conflict-center"],
+    });
+    expect(
+      client.getQueryCache().find({ queryKey: ["skills", "unmanaged"] })
+        ?.options.gcTime,
+    ).toBe(Infinity);
+  });
+
+  it("uses an empty successful scan to clear every installed cache row", async () => {
+    mocks.scanUnmanaged.mockResolvedValueOnce({
+      installed: [],
+      unmanaged: [],
+      issues: [],
+      updatedCount: 0,
+      removedCount: 2,
+    });
+    const client = createClient();
+    client.setQueryData(
+      ["skills", "installed"],
+      [makeSkill("alpha"), makeSkill("beta")],
+    );
+    const { result } = renderHook(
+      () => useScanUnmanagedSkills({ enabled: false }),
+      { wrapper: wrapper(client) },
+    );
+
+    await act(async () => {
+      await result.current.refetch();
+    });
+
+    expect(
+      client.getQueryData<InstalledSkill[]>(["skills", "installed"]),
+    ).toEqual([]);
+  });
+
+  it("does not alter the installed cache when scanning fails", async () => {
+    const existing = [makeSkill("alpha")];
+    mocks.scanUnmanaged.mockRejectedValueOnce(new Error("scan failed"));
+    const client = createClient();
+    client.setQueryData(["skills", "installed"], existing);
+    const { result } = renderHook(
+      () => useScanUnmanagedSkills({ enabled: false }),
+      { wrapper: wrapper(client) },
+    );
+
+    await act(async () => {
+      await result.current.refetch();
+    });
+
+    expect(client.getQueryData<InstalledSkill[]>(["skills", "installed"])).toBe(
+      existing,
     );
   });
 

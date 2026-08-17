@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::{Arc, Barrier};
 
 use sha2::{Digest, Sha256};
 
@@ -185,7 +186,7 @@ fn failed_operations_keep_only_the_three_most_recent_failed_points() {
     }
 
     let listed = store.list().unwrap();
-    assert_eq!(listed.len(), MAX_FAILED_ROLLBACK_POINTS);
+    assert_eq!(listed.len(), MAX_ROLLBACK_POINTS);
     assert!(listed
         .iter()
         .all(|point| point.state == RollbackPointState::Failed));
@@ -196,6 +197,124 @@ fn failed_operations_keep_only_the_three_most_recent_failed_points() {
     for id in &ids[1..] {
         assert!(store.restore(id).is_ok(), "retained {id}");
     }
+}
+
+#[test]
+fn create_counts_pending_and_failed_points_and_evicts_the_oldest_failed_point() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&temp.path().join(DIRECTORY_NAME));
+    let oldest_failed = store
+        .create(RollbackPointPurpose::DataMigration, 100, b"oldest-failed")
+        .unwrap();
+    store
+        .retain_after_failure(&oldest_failed.id, 1_000)
+        .unwrap();
+    let crash_left_pending = store
+        .create(RollbackPointPurpose::WebdavSync, 200, b"pending")
+        .unwrap();
+    let newest_failed = store
+        .create(
+            RollbackPointPurpose::ConflictResolution,
+            300,
+            b"newest-failed",
+        )
+        .unwrap();
+    store
+        .retain_after_failure(&newest_failed.id, 1_300)
+        .unwrap();
+
+    let replacement = store
+        .create(RollbackPointPurpose::RestoreOperation, 400, b"replacement")
+        .unwrap();
+
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), MAX_ROLLBACK_POINTS);
+    assert!(listed.iter().any(|point| point.id == crash_left_pending.id));
+    assert!(listed.iter().any(|point| point.id == newest_failed.id));
+    assert!(listed.iter().any(|point| point.id == replacement.id));
+    assert_eq!(
+        store.restore(&oldest_failed.id).unwrap_err().code,
+        TemporaryRollbackErrorCode::NotFound
+    );
+    assert_eq!(rollback_files(store.root()).len(), MAX_ROLLBACK_POINTS);
+}
+
+#[test]
+fn crash_left_pending_points_fill_capacity_and_fail_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(DIRECTORY_NAME);
+    let original = store(&root);
+    let mut pending_ids = Vec::new();
+    for timestamp in 100..103 {
+        pending_ids.push(
+            original
+                .create(
+                    RollbackPointPurpose::DataMigration,
+                    timestamp,
+                    format!("pending-{timestamp}").as_bytes(),
+                )
+                .unwrap()
+                .id,
+        );
+    }
+    drop(original);
+
+    let reopened = store(&root);
+    let error = reopened
+        .create(RollbackPointPurpose::WebdavSync, 200, b"must-not-persist")
+        .unwrap_err();
+
+    assert_eq!(error.code, TemporaryRollbackErrorCode::InvalidState);
+    assert_eq!(error.context.get("pendingPoints"), Some(&"3".to_string()));
+    let listed = reopened.list().unwrap();
+    assert_eq!(listed.len(), MAX_ROLLBACK_POINTS);
+    assert!(listed
+        .iter()
+        .all(|point| point.state == RollbackPointState::Pending));
+    assert!(pending_ids
+        .iter()
+        .all(|id| listed.iter().any(|point| &point.id == id)));
+    assert_eq!(rollback_files(&root).len(), MAX_ROLLBACK_POINTS);
+}
+
+#[test]
+fn concurrent_creates_across_store_instances_never_exceed_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join(DIRECTORY_NAME);
+    let barrier = Arc::new(Barrier::new(9));
+    let mut threads = Vec::new();
+    for timestamp in 100..108 {
+        let root = root.clone();
+        let barrier = Arc::clone(&barrier);
+        threads.push(std::thread::spawn(move || {
+            let store = store(&root);
+            barrier.wait();
+            store.create(
+                RollbackPointPurpose::ConflictResolution,
+                timestamp,
+                format!("concurrent-{timestamp}").as_bytes(),
+            )
+        }));
+    }
+    barrier.wait();
+
+    let results = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 3);
+    assert!(results
+        .iter()
+        .filter_map(|result| result.as_ref().err())
+        .all(|error| error.code == TemporaryRollbackErrorCode::InvalidState));
+
+    let reopened = store(&root);
+    let listed = reopened.list().unwrap();
+    assert_eq!(listed.len(), MAX_ROLLBACK_POINTS);
+    assert!(listed
+        .iter()
+        .all(|point| point.state == RollbackPointState::Pending));
+    assert_eq!(rollback_files(&root).len(), MAX_ROLLBACK_POINTS);
 }
 
 #[test]

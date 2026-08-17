@@ -20,20 +20,25 @@ export interface InstalledSkill {
   updatedAtMs: number;
 }
 
-/** One live copy of an unmanaged Skill: client and its content digest. */
-export interface UnmanagedSkillCopy {
-  client: ManagedAppId;
-  contentHash: string;
-}
-
 export interface UnmanagedSkill {
   directory: string;
   name: string;
   description?: string;
   foundIn: ManagedAppId[];
-  /** Per-client content digests from the scan; absent falls back to source-only defaults. */
-  copies?: UnmanagedSkillCopy[];
-  path: string;
+}
+
+export interface LocalSkillScanIssue {
+  directory: string;
+  clients: ManagedAppId[];
+  kind: "divergent_copies" | "invalid_copy" | "case_collision";
+}
+
+export interface LocalSkillScanResult {
+  installed: InstalledSkill[];
+  unmanaged: UnmanagedSkill[];
+  issues: LocalSkillScanIssue[];
+  updatedCount: number;
+  removedCount: number;
 }
 
 export interface ImportSkillSelection {
@@ -74,7 +79,7 @@ export const skillsApi = {
     return await invoke("sync_skill_from_live", { id, sourceApp });
   },
 
-  async scanUnmanaged(): Promise<UnmanagedSkill[]> {
+  async scanUnmanaged(): Promise<LocalSkillScanResult> {
     return await invoke("scan_unmanaged_skills");
   },
 

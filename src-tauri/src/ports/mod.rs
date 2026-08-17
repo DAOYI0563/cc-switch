@@ -34,13 +34,13 @@ pub use local_protection::{
 };
 pub use local_scan::{
     LocalReconciliationBaselinePort, LocalReconciliationState, LocalReconciliationStatePort,
-    LocalScanParsedRecord, LocalScanParsedSnapshot, LocalScanParserPort, LocalScanReadFailure,
-    LocalScanSummaryPort,
+    LocalScanFirstObservation, LocalScanParsedRecord, LocalScanParsedSnapshot, LocalScanParserPort,
+    LocalScanReadFailure, LocalScanSummaryPort, ManagedSkillInventoryPort,
 };
 pub use local_skill::{
-    LocalSkillFile, LocalSkillLiveCandidate, LocalSkillRepository, LocalSkillRepositoryError,
-    LocalSkillTree, LocalSkillTreeError, LocalSkillTreeErrorCode, LocalSkillTreePort,
-    LocalSkillTreeSnapshot,
+    LocalSkillDirectoryCandidate, LocalSkillFile, LocalSkillLiveCandidate, LocalSkillRepository,
+    LocalSkillRepositoryError, LocalSkillTree, LocalSkillTreeError, LocalSkillTreeErrorCode,
+    LocalSkillTreePort, LocalSkillTreeSnapshot,
 };
 pub use retained_migration::{RetainedMigrationTarget, RetainedMigrationTargetError};
 pub use secret_store::{DeviceSecretId, SecretStore, SecretStoreError, SecretStoreErrorCode};

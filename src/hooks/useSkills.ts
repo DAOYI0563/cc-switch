@@ -96,11 +96,21 @@ export function useSyncSkillFromLive() {
 }
 
 export function useScanUnmanagedSkills(options?: { enabled?: boolean }) {
+  const queryClient = useQueryClient();
   return useQuery({
     queryKey: ["skills", "unmanaged"],
-    queryFn: () => skillsApi.scanUnmanaged(),
+    queryFn: async () => {
+      const result = await skillsApi.scanUnmanaged();
+      queryClient.setQueryData<InstalledSkill[]>(
+        ["skills", "installed"],
+        result.installed,
+      );
+      await queryClient.invalidateQueries({ queryKey: ["conflict-center"] });
+      return result;
+    },
     enabled: options?.enabled ?? false,
     staleTime: 30 * 1000,
+    gcTime: Infinity,
     placeholderData: keepPreviousData,
   });
 }
@@ -127,5 +137,7 @@ export function useImportSkillsFromApps() {
 export type {
   ImportSkillSelection,
   InstalledSkill,
+  LocalSkillScanIssue,
+  LocalSkillScanResult,
   UnmanagedSkill,
 } from "@/lib/api/skills";

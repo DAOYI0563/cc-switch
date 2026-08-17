@@ -5,7 +5,9 @@ use serde_json::{json, Value};
 
 use crate::adapters::live_provider_config::runtime_adapter;
 use crate::adapters::local_reconciliation_state::DatabaseLocalReconciliationStateAdapter;
-use crate::adapters::local_scan_parser::FixedLocalScanParserAdapter;
+use crate::adapters::local_scan_parser::{
+    DatabaseLocalScanParserAdapter, FixedLocalScanParserAdapter,
+};
 use crate::adapters::local_skill_tree::LocalSkillTreeAdapter;
 use crate::app_config::{LegacyAppType, McpApps, McpServer};
 use crate::domain::{
@@ -20,8 +22,8 @@ use crate::ports::{
 };
 use crate::provider::{Provider, ProviderMeta};
 use crate::services::{
-    reconciliation_snapshot_from_parsed, record_runtime_local_writes, LocalScanCoordinator,
-    LocalSkillService, McpService, PromptService, ProviderService,
+    reconciliation_snapshot_from_parsed, record_database_local_writes, record_runtime_local_writes,
+    LocalScanCoordinator, LocalSkillService, McpService, PromptService, ProviderService,
 };
 use crate::store::AppState;
 
@@ -429,8 +431,9 @@ impl<'a> RuntimeLocalConflictResolution<'a> {
             trees
                 .remove(target_client, directory)
                 .map_err(|_| apply_failed())?;
-            record_runtime_local_writes(
+            record_database_local_writes(
                 &self.app_state.local_scan_writes,
+                self.app_state.db.clone(),
                 [LocalScanTarget {
                     domain: LocalScanDomain::Skill,
                     client_id: target_client,
@@ -480,8 +483,9 @@ impl<'a> RuntimeLocalConflictResolution<'a> {
             )
             .with_context("treeCode", format!("{:?}", primary.code)));
         }
-        record_runtime_local_writes(
+        record_database_local_writes(
             &self.app_state.local_scan_writes,
+            self.app_state.db.clone(),
             [LocalScanTarget {
                 domain: LocalScanDomain::Skill,
                 client_id: target_client,
@@ -497,7 +501,11 @@ impl<'a> RuntimeLocalConflictResolution<'a> {
         expected: Option<&str>,
         live: bool,
     ) -> Result<(), ConflictCenterError> {
-        let parsed = if live {
+        let parsed = if live && target.domain == LocalScanDomain::Skill {
+            DatabaseLocalScanParserAdapter::runtime(self.app_state.db.clone())
+                .parse_changed(target)
+                .map_err(|_| validation_failed())?
+        } else if live {
             FixedLocalScanParserAdapter::runtime()
                 .parse_changed(target)
                 .map_err(|_| validation_failed())?

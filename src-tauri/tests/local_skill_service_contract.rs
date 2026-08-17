@@ -93,8 +93,8 @@ fn imports_from_the_explicit_live_source_and_copies_plain_trees_to_three_clients
         state.db.list_core_skills().expect("list core Skills"),
         imported
     );
-    assert_eq!(state.local_scan_writes.pending_count(), 2);
-    assert_eq!(state.local_scan_writes.last_generation(), 2);
+    assert_eq!(state.local_scan_writes.pending_count(), 3);
+    assert_eq!(state.local_scan_writes.last_generation(), 3);
 }
 
 #[test]

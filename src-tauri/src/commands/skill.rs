@@ -1,8 +1,8 @@
 //! Local-only Skill command boundary.
 
 use crate::commands::parse_managed_client_id;
-use crate::domain::{LocalSkill, LocalSkillImport, UnmanagedLocalSkill};
-use crate::services::LocalSkillService;
+use crate::domain::{LocalSkill, LocalSkillImport, LocalSkillScanResult};
+use crate::services::{ConflictCenterRuntimeState, LocalSkillService};
 use crate::store::AppState;
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
@@ -100,15 +100,25 @@ pub async fn open_skill_directory(
 #[tauri::command]
 pub async fn scan_unmanaged_skills(
     app_state: State<'_, AppState>,
-) -> Result<Vec<UnmanagedLocalSkill>, String> {
+    conflicts: State<'_, ConflictCenterRuntimeState>,
+) -> Result<LocalSkillScanResult, String> {
     let app_state = app_state.inner().clone();
-    let scan = tauri::async_runtime::spawn_blocking(move || {
-        LocalSkillService::scan_unmanaged(&app_state).map_err(|error| error.to_string())
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(60), scan)
-        .await
-        .map_err(|_| "WSL 文件通道无响应：扫描已超时，请检查 WSL 状态后重试".to_string())?
-        .map_err(|error| format!("Skill 扫描任务执行失败: {error}"))?
+    let coordinator = conflicts.coordinator();
+    // A timeout cannot cancel spawn_blocking. This command may commit the Skill
+    // index, so it must wait for the task's real completion before reporting.
+    tauri::async_runtime::spawn_blocking(move || {
+        let result =
+            LocalSkillService::scan_unmanaged(&app_state).map_err(|error| error.to_string())?;
+        for client_id in crate::domain::ManagedClientId::ALL {
+            coordinator.restart_target_observation(crate::domain::LocalScanTarget {
+                domain: crate::domain::LocalScanDomain::Skill,
+                client_id,
+            });
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("Skill 扫描任务执行失败: {error}"))?
 }
 
 #[tauri::command]

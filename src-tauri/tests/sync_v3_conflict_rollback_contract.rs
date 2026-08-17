@@ -160,6 +160,8 @@ struct MemoryRollbacks {
     created_purposes: Mutex<Vec<RollbackPointPurpose>>,
     deleted: Mutex<usize>,
     retained: Mutex<usize>,
+    fail_delete: bool,
+    fail_retain: bool,
 }
 
 impl TemporaryRollbackStore for MemoryRollbacks {
@@ -190,8 +192,14 @@ impl TemporaryRollbackStore for MemoryRollbacks {
     }
 
     fn delete_after_success(&self, id: &str) -> Result<(), TemporaryRollbackError> {
-        self.points.lock().unwrap().remove(id).ok_or_else(missing)?;
         *self.deleted.lock().unwrap() += 1;
+        if self.fail_delete {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::Io,
+                "injected rollback delete failure with sensitive details",
+            ));
+        }
+        self.points.lock().unwrap().remove(id).ok_or_else(missing)?;
         Ok(())
     }
 
@@ -200,11 +208,17 @@ impl TemporaryRollbackStore for MemoryRollbacks {
         id: &str,
         failed_at_ms: i64,
     ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
+        *self.retained.lock().unwrap() += 1;
+        if self.fail_retain {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::Protection,
+                "injected rollback retention failure with sensitive details",
+            ));
+        }
         let mut points = self.points.lock().unwrap();
         let point = points.get_mut(id).ok_or_else(missing)?;
         point.state = RollbackPointState::Failed;
         point.failed_at_ms = Some(failed_at_ms);
-        *self.retained.lock().unwrap() += 1;
         Ok(point.clone())
     }
 
@@ -253,6 +267,46 @@ fn committed_clean_records_use_webdav_rollback_lifecycle() {
     assert_eq!(error.code, ConflictCenterErrorCode::Apply);
     assert_eq!(*failed_rollbacks.deleted.lock().unwrap(), 0);
     assert_eq!(*failed_rollbacks.retained.lock().unwrap(), 1);
+}
+
+#[test]
+fn committed_sync_batch_survives_rollback_cleanup_failure_and_marks_the_point() {
+    let applier = RecordingApplier::default();
+    let rollbacks = MemoryRollbacks {
+        fail_delete: true,
+        ..Default::default()
+    };
+
+    apply_committed_sync_batch(&applier, &rollbacks, NOW, &local_commit(merge_batch()))
+        .expect("committed sync apply must survive rollback cleanup failure");
+
+    assert_eq!(*applier.captured.lock().unwrap(), 1);
+    assert_eq!(*applier.applied.lock().unwrap(), 1);
+    assert_eq!(*rollbacks.deleted.lock().unwrap(), 1);
+    assert_eq!(*rollbacks.retained.lock().unwrap(), 1);
+    let points = rollbacks.points.lock().unwrap();
+    assert_eq!(points["point-1"].state, RollbackPointState::Failed);
+    assert_eq!(points["point-1"].failed_at_ms, Some(NOW));
+}
+
+#[test]
+fn rollback_mark_failure_does_not_replace_sync_apply_error() {
+    let applier = RecordingApplier {
+        fail: true,
+        ..Default::default()
+    };
+    let rollbacks = MemoryRollbacks {
+        fail_retain: true,
+        ..Default::default()
+    };
+
+    let error = apply_committed_sync_batch(&applier, &rollbacks, NOW, &local_commit(merge_batch()))
+        .unwrap_err();
+
+    assert_eq!(error.code, ConflictCenterErrorCode::Apply);
+    assert_eq!(error.message, "fixture apply failed");
+    assert_eq!(*rollbacks.retained.lock().unwrap(), 1);
+    assert_eq!(*rollbacks.deleted.lock().unwrap(), 0);
 }
 
 #[test]

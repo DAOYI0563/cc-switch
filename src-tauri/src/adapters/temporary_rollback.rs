@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
@@ -18,7 +19,7 @@ const DIRECTORY_NAME: &str = "temporary-rollbacks";
 const FILE_EXTENSION: &str = "rollback";
 const ENVELOPE_SCHEMA_VERSION: u32 = 1;
 const PROTECTED_PAYLOAD_SCHEMA_VERSION: u32 = 1;
-const MAX_FAILED_ROLLBACK_POINTS: usize = 3;
+const MAX_ROLLBACK_POINTS: usize = 3;
 const MAX_ENVELOPE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,8 +181,12 @@ impl<P: LocalProtector> FixedTemporaryRollbackStore<P> {
         payload: &[u8],
     ) -> Result<(), TemporaryRollbackError> {
         let id = metadata.id.clone();
-        let path = self.path_for(&id)?;
         let bytes = self.encode(metadata, payload)?;
+        self.write_encoded(&id, &bytes)
+    }
+
+    fn write_encoded(&self, id: &str, bytes: &[u8]) -> Result<(), TemporaryRollbackError> {
+        let path = self.path_for(id)?;
         ensure_safe_directory(&self.root)?;
         match fs::symlink_metadata(&path) {
             Ok(existing) if metadata_is_link_or_reparse(&existing) => {
@@ -191,7 +196,7 @@ impl<P: LocalProtector> FixedTemporaryRollbackStore<P> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error(&path, "inspect rollback destination", error)),
         }
-        crate::config::atomic_write(&path, &bytes).map_err(|error| {
+        crate::config::atomic_write(&path, bytes).map_err(|error| {
             TemporaryRollbackError::new(
                 TemporaryRollbackErrorCode::Io,
                 format!("failed to atomically write temporary rollback point: {error}"),
@@ -227,22 +232,81 @@ impl<P: LocalProtector> FixedTemporaryRollbackStore<P> {
         fs::remove_file(&path).map_err(|error| io_error(&path, "delete rollback point", error))
     }
 
-    fn prune_failed(&self) -> Result<(), TemporaryRollbackError> {
-        let mut failed: Vec<_> = self
-            .list()?
-            .into_iter()
+    fn reserve_create_slot(&self) -> Result<(), TemporaryRollbackError> {
+        let points = self.list()?;
+        let mut remaining = points.len();
+        if remaining < MAX_ROLLBACK_POINTS {
+            return Ok(());
+        }
+
+        let mut failed: Vec<_> = points
+            .iter()
             .filter(|metadata| metadata.state == RollbackPointState::Failed)
             .collect();
         failed.sort_by(|left, right| {
-            right
-                .failed_at_ms
-                .cmp(&left.failed_at_ms)
-                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
-                .then_with(|| right.id.cmp(&left.id))
+            left.failed_at_ms
+                .cmp(&right.failed_at_ms)
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
         });
-        for metadata in failed.into_iter().skip(MAX_FAILED_ROLLBACK_POINTS) {
+        for metadata in failed {
+            if remaining < MAX_ROLLBACK_POINTS {
+                break;
+            }
             self.remove(&metadata.id)?;
+            remaining -= 1;
         }
+
+        if remaining >= MAX_ROLLBACK_POINTS {
+            let pending = points
+                .iter()
+                .filter(|metadata| metadata.state == RollbackPointState::Pending)
+                .count();
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::InvalidState,
+                "temporary rollback capacity is occupied by pending points",
+            )
+            .with_context("pendingPoints", pending.to_string())
+            .with_context("maximumPoints", MAX_ROLLBACK_POINTS.to_string()));
+        }
+
+        Ok(())
+    }
+
+    fn prune_excess_points(&self) -> Result<(), TemporaryRollbackError> {
+        let points = self.list()?;
+        let mut remaining = points.len();
+        if remaining <= MAX_ROLLBACK_POINTS {
+            return Ok(());
+        }
+
+        let mut failed: Vec<_> = points
+            .iter()
+            .filter(|metadata| metadata.state == RollbackPointState::Failed)
+            .collect();
+        failed.sort_by(|left, right| {
+            left.failed_at_ms
+                .cmp(&right.failed_at_ms)
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for metadata in failed {
+            if remaining <= MAX_ROLLBACK_POINTS {
+                break;
+            }
+            self.remove(&metadata.id)?;
+            remaining -= 1;
+        }
+
+        if remaining > MAX_ROLLBACK_POINTS {
+            return Err(TemporaryRollbackError::new(
+                TemporaryRollbackErrorCode::InvalidState,
+                "temporary rollback capacity is exceeded by pending points",
+            )
+            .with_context("remainingPoints", remaining.to_string())
+            .with_context("maximumPoints", MAX_ROLLBACK_POINTS.to_string()));
+        }
+
         Ok(())
     }
 }
@@ -265,7 +329,10 @@ impl<P: LocalProtector> TemporaryRollbackStore for FixedTemporaryRollbackStore<P
             payload_size_bytes: payload.len() as u64,
             payload_sha256: sha256(payload),
         };
-        self.write(metadata.clone(), payload)?;
+        let bytes = self.encode(metadata.clone(), payload)?;
+        let _mutation = mutation_lock()?;
+        self.reserve_create_slot()?;
+        self.write_encoded(&metadata.id, &bytes)?;
         Ok(metadata)
     }
 
@@ -274,6 +341,7 @@ impl<P: LocalProtector> TemporaryRollbackStore for FixedTemporaryRollbackStore<P
     }
 
     fn delete_after_success(&self, id: &str) -> Result<(), TemporaryRollbackError> {
+        let _mutation = mutation_lock()?;
         self.remove(id)
     }
 
@@ -282,6 +350,7 @@ impl<P: LocalProtector> TemporaryRollbackStore for FixedTemporaryRollbackStore<P
         id: &str,
         failed_at_ms: i64,
     ) -> Result<RollbackPointMetadata, TemporaryRollbackError> {
+        let _mutation = mutation_lock()?;
         let (mut metadata, payload) = self.read(id)?;
         if failed_at_ms < metadata.created_at_ms {
             return Err(TemporaryRollbackError::new(
@@ -292,7 +361,7 @@ impl<P: LocalProtector> TemporaryRollbackStore for FixedTemporaryRollbackStore<P
         metadata.state = RollbackPointState::Failed;
         metadata.failed_at_ms = Some(failed_at_ms);
         self.write(metadata.clone(), &payload)?;
-        self.prune_failed()?;
+        self.prune_excess_points()?;
         Ok(metadata)
     }
 
@@ -339,6 +408,16 @@ impl<P: LocalProtector> TemporaryRollbackStore for FixedTemporaryRollbackStore<P
         });
         Ok(metadata)
     }
+}
+
+fn mutation_lock() -> Result<MutexGuard<'static, ()>, TemporaryRollbackError> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().map_err(|error| {
+        TemporaryRollbackError::new(
+            TemporaryRollbackErrorCode::InvalidState,
+            format!("temporary rollback mutation lock is poisoned: {error}"),
+        )
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {
